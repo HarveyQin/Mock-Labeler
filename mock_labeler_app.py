@@ -78,9 +78,6 @@ def safe_int(x: Any, default: int = 0) -> int:
     except Exception:
         return default
 
-import re
-import html
-
 def java_class_name_from_path(p: str) -> str:
     """
     Show only class name for a java file path.
@@ -981,9 +978,6 @@ if mode == "Review":
         f"CCTR_Bin: {row.get('cctr_bin')}"
     )
 
-    test_path, test_path_note = resolve_test_path(project_name, row)
-    test_src = row.get("test_source") or (get_source_content(project_name, test_path) if test_path else "")
-
     st.subheader("🧾 Test Source")
 
     test_path, test_path_note = resolve_test_path(project_name, row)
@@ -1020,6 +1014,28 @@ if mode == "Review":
             st.caption("Full test suite (method is marked with comment banners)")
             marked_src = add_markers_around_method(test_src_full, method_src, method_name)
             st.code(marked_src, language="java")
+
+    # ---- Dependencies ----
+    st.subheader("🔗 Dependencies")
+
+    deps = get_dependencies(project_name, test_path)
+    if deps:
+        max_deps = st.number_input(
+            "Max dependency files to show",
+            min_value=5,
+            max_value=200,
+            value=40,
+            step=5
+        )
+        for dp in deps[: int(max_deps)]:
+            title = java_class_name_from_path(dp)  # only class name shown
+            with st.expander(title):
+                # optional: show full path inside the expander
+                # st.caption(dp)
+                st.code(get_source_content(project_name, dp), language="java")
+    else:
+        st.caption("No dependencies found for this test.")
+
 
     st.subheader("🧩 Your Assigned Instantiations in This Case")
     insts_all = get_instantiations_for_case(project_name, suite_basename, method_name)
