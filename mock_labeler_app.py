@@ -240,7 +240,7 @@ def load_annotations_for_inst_ids(inst_ids: List[str]) -> Dict[str, Dict[str, An
         select inst_id::text as inst_id,
                decision, notes, rule_ids, rule_labels, updated_at, updated_by
         from annotations
-        where inst_id = any(%s)
+        where inst_id = any(%s::uuid[])
         """,
         (inst_ids,),
     )
