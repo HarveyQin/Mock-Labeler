@@ -14,7 +14,7 @@ SAMPLED_CSV = Path("data/sampled_tests.csv")
 OBJECT_LIST_DIR = Path("data\Object Instantiations Lists")
 RULE_CSV = Path("data/mock_rules.csv")
 
-DB_URL = ""
+DB_URL = "postgresql://neondb_owner:npg_I3eq9uZprPXL@ep-frosty-rice-adydzy86-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 def norm_path(p: str) -> str:
     return str(Path(p).as_posix())

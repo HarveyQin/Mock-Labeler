@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-inst_labeler_app_pg.py
+mock_labeler_app.py
 
-Streamlit app for labeling whether each object instantiation SHOULD be mocked.
-All data is read/written from Postgres (Neon).
+Cross-validation-ready Streamlit app:
+- Scope of review: ONLY object_instantiations that belong to sampled_tests
+  (matched by project + suite_basename(file) + method(test_case))
+- Multi-reviewer annotations: annotations_cv(inst_id, reviewer_id)
+- Assignments: assignments(inst_id, reviewer_id, bucket) to split workload evenly
 
-Matching rule (guaranteed by user):
-- object_instantiations matched by (project, test_suite_basename == basename(sampled_tests.file), test_case == sampled_tests.method)
-
-Key design:
-- object_instantiations has inst_id (UUID PK) + occurrence_in_case (to preserve duplicates)
-- annotations is keyed by inst_id (UPSERT), safe for multi-user collaboration
+Modes:
+- Review: reviewers label ONLY their assigned instantiations
+- Compare: compare reviewer vs gold and export disagreements
+- Admin: create/reset assignments and view counts
 
 Secrets:
 - st.secrets["DB_URL"] = "postgresql://.../neondb?sslmode=require"
@@ -18,12 +19,16 @@ Secrets:
 
 import json
 from typing import Dict, List, Any, Optional, Tuple
+from io import StringIO
+import csv
 
 import streamlit as st
+import pandas as pd
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 VALID_DECISIONS = ["mock", "no-mock", "uncertain", "skip"]
+GOLD_REVIEWER_ID = "gold"
 
 
 # ===================== DB =====================
@@ -32,9 +37,7 @@ VALID_DECISIONS = ["mock", "no-mock", "uncertain", "skip"]
 def get_conn():
     db_url = st.secrets.get("DB_URL")
     if not db_url:
-        raise RuntimeError(
-            "Missing DB_URL in st.secrets. Add it in .streamlit/secrets.toml or Community Cloud Secrets."
-        )
+        raise RuntimeError("Missing DB_URL in st.secrets.")
     conn = psycopg2.connect(db_url)
     conn.autocommit = True
     return conn
@@ -70,127 +73,120 @@ def basename_of_path(s: str) -> str:
     return s.split("/")[-1]
 
 
-def build_where_clause(
-    sel_project: str,
-    sel_bin: str,
-    sel_aware: str,
-    dep_range: Tuple[int, int],
-    q: str
-) -> Tuple[str, List[Any]]:
-    clauses = []
-    params: List[Any] = []
-
-    if sel_project != "ALL":
-        clauses.append("st.project = %s")
-        params.append(sel_project)
-
-    if sel_bin != "ALL":
-        clauses.append("st.cctr_bin = %s")
-        params.append(sel_bin)
-
-    if sel_aware != "ALL":
-        clauses.append("st.testaware = %s")
-        params.append(sel_aware)
-
-    clauses.append("coalesce(st.dependencycount, 0) between %s and %s")
-    params.extend([int(dep_range[0]), int(dep_range[1])])
-
-    if q:
-        qq = f"%{q.lower()}%"
-        clauses.append("(lower(st.file) like %s or lower(st.method) like %s)")
-        params.extend([qq, qq])
-
-    where = " where " + " and ".join(clauses) if clauses else ""
-    return where, params
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
 
 
-# ===================== Filter options =====================
+# ===================== Sampled scope (instantiations under sampled_tests) =====================
 
 @st.cache_data(show_spinner=False)
-def get_filter_options() -> Dict[str, Any]:
-    projects = [r["project"] for r in db_fetchall("select distinct project from sampled_tests order by project")]
-    bins = [r["cctr_bin"] for r in db_fetchall(
-        "select distinct cctr_bin from sampled_tests where cctr_bin is not null and cctr_bin <> '' order by cctr_bin"
-    )]
-    aware = [r["testaware"] for r in db_fetchall(
-        "select distinct testaware from sampled_tests where testaware is not null and testaware <> '' order by testaware"
-    )]
-    dep = db_fetchone("select min(coalesce(dependencycount,0)) as mn, max(coalesce(dependencycount,0)) as mx from sampled_tests") or {"mn": 0, "mx": 0}
-    return {
-        "projects": projects,
-        "bins": bins,
-        "aware": aware,
-        "dep_min": int(dep["mn"] or 0),
-        "dep_max": int(dep["mx"] or 0),
-    }
-
-
-def get_cases_count(where: str, params: List[Any]) -> int:
-    row = db_fetchone(f"select count(*) as n from sampled_tests st {where}", tuple(params))
-    return int(row["n"])
-
-
-def get_case_at_index(where: str, params: List[Any], offset: int) -> Optional[Dict[str, Any]]:
+def get_sampled_scope_inst_ids() -> List[str]:
+    """
+    Return all inst_id (uuid as text) that belong to sampled_tests scope.
+    """
     rows = db_fetchall(
-        f"""
-        select st.*
-        from sampled_tests st
-        {where}
-        order by st.id
-        offset %s limit 1
-        """,
-        tuple(params + [offset]),
+        """
+        with stf as (
+          select
+            st.project,
+            regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+            st.method
+          from sampled_tests st
+        )
+        select oi.inst_id::text as inst_id
+        from object_instantiations oi
+        join stf
+          on stf.project = oi.project
+         and stf.suite_basename = oi.test_suite_basename
+         and stf.method = oi.test_case
+        order by oi.project, oi.test_suite_basename, oi.test_case, oi.class_name, oi.occurrence_in_case, oi.inst_id
+        """
     )
-    return rows[0] if rows else None
+    return [r["inst_id"] for r in rows]
 
-
-# ===================== Progress =====================
-
-def get_progress_under_filters(where: str, params: List[Any]) -> Dict[str, int]:
-    """
-    total_insts: instantiation rows for all sampled_tests under filters
-    labeled_insts: those with annotations.decision != 'uncertain'
-    """
-    sql_total = f"""
-    with stf as (
-      select st.project, st.method,
-             regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename
-      from sampled_tests st
-      {where}
-    )
-    select count(*) as n
-    from object_instantiations oi
-    join stf
-      on stf.project = oi.project
-     and stf.method = oi.test_case
-     and stf.suite_basename = oi.test_suite_basename
-    """
-    total = int((db_fetchone(sql_total, tuple(params)) or {"n": 0})["n"] or 0)
-
-    sql_labeled = f"""
-    with stf as (
-      select st.project, st.method,
-             regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename
-      from sampled_tests st
-      {where}
-    )
-    select count(*) as n
-    from object_instantiations oi
-    join stf
-      on stf.project = oi.project
-     and stf.method = oi.test_case
-     and stf.suite_basename = oi.test_suite_basename
-    join annotations a
-      on a.inst_id = oi.inst_id
-    where a.decision is not null and a.decision <> 'uncertain'
-    """
-    labeled = int((db_fetchone(sql_labeled, tuple(params)) or {"n": 0})["n"] or 0)
-    return {"total_insts": total, "labeled_insts": labeled}
-
-
-# ===================== Domain reads/writes =====================
 
 @st.cache_data(show_spinner=False)
+def get_sampled_cases_for_reviewer(reviewer_id: str) -> List[Dict[str, Any]]:
+    """
+    List sampled_tests cases that have at least one instantiation assigned to reviewer.
+    """
+    rows = db_fetchall(
+        """
+        with st as (
+          select
+            st.id,
+            st.project,
+            st.file,
+            st.method,
+            regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+            st.testaware,
+            st.mockintensity,
+            st.dependencycount,
+            st.cctr_bin,
+            st.test_file_path,
+            st.test_source
+          from sampled_tests st
+        ),
+        assigned as (
+          select distinct
+            oi.project, oi.test_suite_basename, oi.test_case
+          from assignments a
+          join object_instantiations oi on oi.inst_id = a.inst_id
+          where a.reviewer_id = %s
+        )
+        select st.*
+        from st
+        join assigned
+          on assigned.project = st.project
+         and assigned.test_suite_basename = st.suite_basename
+         and assigned.test_case = st.method
+        order by st.id
+        """,
+        (reviewer_id,),
+    )
+    return rows
+
+
+def get_instantiations_for_case(project: str, suite_basename: str, method: str) -> List[Dict[str, Any]]:
+    return db_fetchall(
+        """
+        select
+          inst_id::text as inst_id,
+          project,
+          test_suite,
+          test_suite_basename,
+          test_case,
+          class_name,
+          occurrence_in_case,
+          mocked,
+          source_row_index
+        from object_instantiations
+        where project=%s and test_suite_basename=%s and test_case=%s
+        order by class_name, occurrence_in_case, source_row_index nulls last, inst_id
+        """,
+        (project, suite_basename, method),
+    )
+
+
+def filter_insts_to_assigned(insts: List[Dict[str, Any]], reviewer_id: str) -> List[Dict[str, Any]]:
+    if not insts:
+        return []
+    inst_ids = [x["inst_id"] for x in insts]
+    rows = db_fetchall(
+        """
+        select inst_id::text as inst_id
+        from assignments
+        where reviewer_id=%s and inst_id = any(%s::uuid[])
+        """,
+        (reviewer_id, inst_ids),
+    )
+    allowed = set(r["inst_id"] for r in rows)
+    return [x for x in insts if x["inst_id"] in allowed]
+
+
 def load_rules() -> List[Dict[str, Any]]:
     return db_fetchall(
         """
@@ -213,69 +209,60 @@ def insert_rule(rule_type: str, high_level_cat: str, criterion: str, mock_decisi
     return int(row["id"])
 
 
-def get_object_instantiations(project: str, suite_basename: str, test_case: str) -> List[Dict[str, Any]]:
-    return db_fetchall(
-        """
-        select inst_id::text as inst_id,
-               test_suite,
-               test_suite_basename,
-               test_case,
-               class_name,
-               occurrence_in_case,
-               mocked,
-               source_row_index
-        from object_instantiations
-        where project=%s and test_suite_basename=%s and test_case=%s
-        order by class_name, occurrence_in_case, source_row_index nulls last, inst_id
-        """,
-        (project, suite_basename, test_case),
-    )
-
-
-def load_annotations_for_inst_ids(inst_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+def load_annotations_cv(inst_ids: List[str], reviewer_id: str) -> Dict[str, Dict[str, Any]]:
     if not inst_ids:
         return {}
     rows = db_fetchall(
         """
-        select inst_id::text as inst_id,
-               decision, notes, rule_ids, rule_labels, updated_at, updated_by
-        from annotations
-        where inst_id = any(%s::uuid[])
+        select
+          inst_id::text as inst_id,
+          reviewer_id,
+          decision,
+          notes,
+          rule_ids,
+          rule_labels,
+          updated_at,
+          updated_by
+        from annotations_cv
+        where reviewer_id=%s and inst_id = any(%s::uuid[])
         """,
-        (inst_ids,),
+        (reviewer_id, inst_ids),
     )
-    out: Dict[str, Dict[str, Any]] = {}
+    out = {}
     for r in rows:
         out[r["inst_id"]] = r
     return out
 
 
-def upsert_annotation(inst_id: str, decision: str, notes: str, rule_ids: List[int], rule_labels: List[str], updated_by: str):
+def upsert_annotation_cv(
+    inst_id: str,
+    reviewer_id: str,
+    decision: str,
+    notes: str,
+    rule_ids: List[int],
+    rule_labels: List[str],
+    updated_by: str
+) -> None:
     db_execute(
         """
-        insert into annotations(inst_id, decision, notes, rule_ids, rule_labels, updated_at, updated_by)
-        values (%s, %s, %s, %s::jsonb, %s::jsonb, now(), %s)
-        on conflict (inst_id)
+        insert into annotations_cv(inst_id, reviewer_id, decision, notes, rule_ids, rule_labels, updated_at, updated_by)
+        values (%s::uuid, %s, %s, %s, %s::jsonb, %s::jsonb, now(), %s)
+        on conflict (inst_id, reviewer_id)
         do update set
-            decision = excluded.decision,
-            notes = excluded.notes,
-            rule_ids = excluded.rule_ids,
-            rule_labels = excluded.rule_labels,
-            updated_at = now(),
-            updated_by = excluded.updated_by
+          decision=excluded.decision,
+          notes=excluded.notes,
+          rule_ids=excluded.rule_ids,
+          rule_labels=excluded.rule_labels,
+          updated_at=now(),
+          updated_by=excluded.updated_by
         """,
-        (
-            inst_id,
-            decision,
-            notes,
-            json.dumps(rule_ids),
-            json.dumps(rule_labels),
-            updated_by,
-        ),
+        (inst_id, reviewer_id, decision, notes, json.dumps(rule_ids), json.dumps(rule_labels), updated_by),
     )
 
 
 def get_source_content(project: str, path: str) -> str:
+    if not path:
+        return ""
     row = db_fetchone(
         "select content from source_files where project=%s and path=%s",
         (project, path),
@@ -300,8 +287,7 @@ def get_dependencies(project: str, test_path: Optional[str]) -> List[str]:
 
 def resolve_test_path(project: str, sampled_test_row: Dict[str, Any]) -> Tuple[Optional[str], str]:
     """
-    Prefer sampled_tests.test_file_path; otherwise infer from test_dependencies using basename.
-    Since you stated suite_basename+method will not collide, basename inference is acceptable.
+    Prefer sampled_tests.test_file_path; else infer by basename from test_dependencies.
     """
     tp = sampled_test_row.get("test_file_path")
     if tp:
@@ -328,297 +314,524 @@ def resolve_test_path(project: str, sampled_test_row: Dict[str, Any]) -> Tuple[O
     return None, "not found in test_dependencies"
 
 
+# ===================== Assignments =====================
+
+def create_assignments_evenly(reviewer_ids: List[str]) -> Dict[str, int]:
+    """
+    Create/overwrite assignments for sampled_tests scope:
+    - Even round-robin across reviewer_ids
+    - Writes assignments(inst_id, reviewer_id, bucket)
+    """
+    reviewer_ids = [r.strip() for r in reviewer_ids if r and r.strip()]
+    if len(reviewer_ids) != 4:
+        raise ValueError("Please provide exactly 4 reviewer_ids.")
+
+    inst_ids = get_sampled_scope_inst_ids()
+    if not inst_ids:
+        raise RuntimeError("No instantiations found under sampled_tests scope.")
+
+    # We will overwrite existing assignments for these reviewers within the sampled scope
+    db_execute(
+        """
+        delete from assignments
+        where reviewer_id = any(%s)
+          and inst_id = any(%s::uuid[])
+        """,
+        (reviewer_ids, inst_ids),
+    )
+
+    rows = []
+    for i, inst_id in enumerate(inst_ids):
+        bucket = (i % 4) + 1
+        reviewer = reviewer_ids[bucket - 1]
+        rows.append((inst_id, reviewer, bucket))
+
+    conn = get_conn()
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            insert into assignments(inst_id, reviewer_id, bucket)
+            values %s
+            on conflict (inst_id, reviewer_id) do update
+              set bucket = excluded.bucket,
+                  assigned_at = now()
+            """,
+            rows,
+            page_size=1000,
+        )
+
+    # counts
+    counts = {r: 0 for r in reviewer_ids}
+    for _, reviewer, _ in rows:
+        counts[reviewer] += 1
+    return counts
+
+
+@st.cache_data(show_spinner=False)
+def get_assignment_counts() -> List[Dict[str, Any]]:
+    return db_fetchall(
+        """
+        select reviewer_id, bucket, count(*) as n
+        from assignments
+        group by reviewer_id, bucket
+        order by bucket, reviewer_id
+        """
+    )
+
+
+def get_reviewer_progress(reviewer_id: str) -> Tuple[int, int]:
+    """
+    Progress in sampled scope: assigned instantiations vs labeled (decision != 'uncertain')
+    """
+    total = db_fetchone("select count(*) as n from assignments where reviewer_id=%s", (reviewer_id,))["n"]
+    labeled = db_fetchone(
+        """
+        select count(*) as n
+        from assignments a
+        join annotations_cv ac
+          on ac.inst_id = a.inst_id and ac.reviewer_id = a.reviewer_id
+        where a.reviewer_id=%s and ac.decision <> 'uncertain'
+        """,
+        (reviewer_id,),
+    )["n"]
+    return int(labeled), int(total)
+
+
+# ===================== Compare =====================
+
+def compare_gold_vs_reviewer(reviewer_id: str) -> pd.DataFrame:
+    """
+    Return a dataframe with per-inst row under sampled scope and assigned-to-reviewer:
+    inst_id, project, suite_basename, test_case, class_name, occurrence,
+    gold_decision, reviewer_decision, agree
+    """
+    rows = db_fetchall(
+        """
+        with stf as (
+          select
+            st.project,
+            regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+            st.method
+          from sampled_tests st
+        ),
+        scope as (
+          select
+            oi.inst_id,
+            oi.project,
+            oi.test_suite_basename,
+            oi.test_case,
+            oi.class_name,
+            oi.occurrence_in_case
+          from object_instantiations oi
+          join stf
+            on stf.project = oi.project
+           and stf.suite_basename = oi.test_suite_basename
+           and stf.method = oi.test_case
+        ),
+        assigned as (
+          select s.*
+          from scope s
+          join assignments a on a.inst_id = s.inst_id
+          where a.reviewer_id = %s
+        ),
+        gold as (
+          select inst_id, decision as gold_decision
+          from annotations_cv
+          where reviewer_id = %s
+        ),
+        rev as (
+          select inst_id, decision as reviewer_decision
+          from annotations_cv
+          where reviewer_id = %s
+        )
+        select
+          a.inst_id::text as inst_id,
+          a.project,
+          a.test_suite_basename as suite_basename,
+          a.test_case,
+          a.class_name,
+          a.occurrence_in_case as occurrence,
+          g.gold_decision,
+          r.reviewer_decision
+        from assigned a
+        left join gold g on g.inst_id = a.inst_id
+        left join rev  r on r.inst_id = a.inst_id
+        order by a.project, a.test_suite_basename, a.test_case, a.class_name, a.occurrence_in_case, a.inst_id
+        """,
+        (reviewer_id, GOLD_REVIEWER_ID, reviewer_id),
+    )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["agree"] = (df["gold_decision"].fillna("") == df["reviewer_decision"].fillna(""))
+    return df
+
+
+def confusion_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    # normalize missing to "MISSING"
+    g = df["gold_decision"].fillna("MISSING")
+    r = df["reviewer_decision"].fillna("MISSING")
+    cats = VALID_DECISIONS + ["MISSING"]
+    mat = pd.crosstab(g, r, rownames=["gold"], colnames=["reviewer"], dropna=False).reindex(index=cats, columns=cats, fill_value=0)
+    return mat
+
+
+def to_csv_download(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
 # ===================== UI =====================
 
-st.set_page_config(page_title="Object Instantiation Mock Labeler (Neon/Postgres)", layout="wide")
-st.title("🧪 Object Instantiation Mock Labeler (Neon/Postgres)")
+st.set_page_config(page_title="Mock Labeler (Cross-validation)", layout="wide")
+st.title("🧪 Mock Labeler (Cross-validation)")
 
-# Identity (works immediately). Swap to OIDC later if needed.
 with st.sidebar:
-    st.header("User")
-    user_name = st.text_input(
-        "Your name / email (for updated_by)",
-        value=st.session_state.get("user_name", "")
-    ).strip()
-    st.session_state["user_name"] = user_name or "unknown"
+    st.header("Mode")
+    mode = st.radio("Choose mode", ["Review", "Compare", "Admin"], index=0)
 
-opts = get_filter_options()
+    st.header("Identity")
+    reviewer_id = st.text_input("reviewer_id (email)", value=st.session_state.get("reviewer_id", "")).strip()
+    st.session_state["reviewer_id"] = reviewer_id
 
-st.sidebar.header("Filters")
-sel_project = st.sidebar.selectbox("Project", ["ALL"] + opts["projects"], index=0)
-sel_bin = st.sidebar.selectbox("CCTR_Bin", ["ALL"] + opts["bins"], index=0)
-sel_aware = st.sidebar.selectbox("TestAware", ["ALL"] + opts["aware"], index=0)
-dep_range = st.sidebar.slider(
-    "DependencyCount range",
-    min_value=opts["dep_min"],
-    max_value=opts["dep_max"],
-    value=(opts["dep_min"], opts["dep_max"])
-)
-q = st.sidebar.text_input("Search in File/Method")
+    st.caption("Gold reviewer_id is fixed as 'gold'.")
 
-where, params = build_where_clause(sel_project, sel_bin, sel_aware, dep_range, q)
+# ---------- Admin ----------
+if mode == "Admin":
+    st.subheader("🛠 Admin: Assignments")
 
-# Progress
-st.sidebar.header("Progress")
-try:
-    prog = get_progress_under_filters(where, params)
-    tot = prog["total_insts"]
-    lab = prog["labeled_insts"]
-    ratio = (lab / tot) if tot else 0.0
-    st.sidebar.progress(ratio)
-    st.sidebar.caption(f"Under filters: labeled {lab} / {tot} instantiations")
-except Exception as e:
-    st.sidebar.warning(f"Progress unavailable: {e}")
+    st.write("This will split **sampled_tests scope instantiations** into 4 equal buckets (round-robin).")
 
-# Pagination
-if "case_idx" not in st.session_state:
-    st.session_state.case_idx = 0
+    c1, c2 = st.columns(2)
+    with c1:
+        r1 = st.text_input("Reviewer #1 (bucket 1)", value=st.session_state.get("r1", "")).strip()
+        r2 = st.text_input("Reviewer #2 (bucket 2)", value=st.session_state.get("r2", "")).strip()
+    with c2:
+        r3 = st.text_input("Reviewer #3 (bucket 3)", value=st.session_state.get("r3", "")).strip()
+        r4 = st.text_input("Reviewer #4 (bucket 4)", value=st.session_state.get("r4", "")).strip()
 
-total_cases = get_cases_count(where, params)
+    st.session_state["r1"], st.session_state["r2"], st.session_state["r3"], st.session_state["r4"] = r1, r2, r3, r4
 
-def move_case(delta: int):
-    if total_cases <= 0:
+    if st.button("✅ Create / Overwrite assignments (sampled scope)"):
+        try:
+            counts = create_assignments_evenly([r1, r2, r3, r4])
+            st.cache_data.clear()
+            st.success("Assignments created.")
+            st.json(counts)
+        except Exception as e:
+            st.error(str(e))
+
+    st.divider()
+    st.subheader("Current assignment counts")
+    ac = get_assignment_counts()
+    if ac:
+        st.dataframe(pd.DataFrame(ac), use_container_width=True)
+    else:
+        st.info("No assignments yet.")
+
+    st.stop()
+
+
+# ---------- Review ----------
+if mode == "Review":
+    if not reviewer_id:
+        st.warning("Please input your reviewer_id in the sidebar.")
+        st.stop()
+    if reviewer_id == GOLD_REVIEWER_ID:
+        st.info("Reviewer mode is for colleagues. Use Compare mode to inspect gold vs reviewer.")
+        st.stop()
+
+    # progress
+    labeled, total = get_reviewer_progress(reviewer_id)
+    st.sidebar.header("Your progress")
+    st.sidebar.progress((labeled / total) if total else 0.0)
+    st.sidebar.caption(f"{labeled} / {total} labeled (decision != uncertain)")
+
+    # cases list for this reviewer
+    cases = get_sampled_cases_for_reviewer(reviewer_id)
+    if not cases:
+        st.info("No cases assigned to you yet. Ask admin to create assignments.")
+        st.stop()
+
+    # pagination over assigned cases
+    if "case_idx" not in st.session_state:
         st.session_state.case_idx = 0
-        return
-    st.session_state.case_idx = max(0, min(total_cases - 1, st.session_state.case_idx + delta))
 
-col_nav1, col_nav2, col_nav3, col_nav4 = st.columns([1, 1, 6, 2])
-with col_nav1:
-    if st.button("⏮ Prev Case"):
-        move_case(-1)
-with col_nav2:
-    if st.button("Next Case ⏭"):
-        move_case(+1)
-with col_nav3:
-    st.write(f"Case {st.session_state.case_idx + 1} / {total_cases}")
-with col_nav4:
-    if total_cases > 0:
-        jump = st.number_input("Jump to index", min_value=1, max_value=total_cases, value=st.session_state.case_idx + 1, step=1)
+    def move_case(delta: int):
+        n = len(cases)
+        if n <= 0:
+            st.session_state.case_idx = 0
+        else:
+            st.session_state.case_idx = max(0, min(n - 1, st.session_state.case_idx + delta))
+
+    col_nav1, col_nav2, col_nav3, col_nav4 = st.columns([1, 1, 6, 2])
+    with col_nav1:
+        if st.button("⏮ Prev Case"):
+            move_case(-1)
+    with col_nav2:
+        if st.button("Next Case ⏭"):
+            move_case(+1)
+    with col_nav3:
+        st.write(f"Assigned Case {st.session_state.case_idx + 1} / {len(cases)}")
+    with col_nav4:
+        jump = st.number_input("Jump", min_value=1, max_value=len(cases), value=st.session_state.case_idx + 1, step=1)
         if st.button("Go"):
             st.session_state.case_idx = int(jump) - 1
 
-if total_cases <= 0:
-    st.info("No test cases under current filter.")
-    st.stop()
+    row = cases[st.session_state.case_idx]
+    project_name = row["project"]
+    file_col = row["file"]
+    method_name = row["method"]
+    suite_basename = basename_of_path(file_col)
 
-row = get_case_at_index(where, params, st.session_state.case_idx)
-if not row:
-    st.warning("Cannot load case row.")
-    st.stop()
-
-project_name = row["project"]
-file_col = row["file"]
-method_name = row["method"]
-suite_basename = basename_of_path(file_col)
-
-st.subheader("📄 Test Case")
-st.markdown(f"**Project:** `{project_name}`  |  **File:** `{file_col}`  |  **Method:** `{method_name}`")
-st.caption(
-    f"TestAware: {row.get('testaware')} | "
-    f"MockIntensity: {row.get('mockintensity')} | "
-    f"DependencyCount: {int(row.get('dependencycount') or 0)} | "
-    f"CCTR_Bin: {row.get('cctr_bin')}"
-)
-
-# Resolve test_path and load test source
-test_path, test_path_note = resolve_test_path(project_name, row)
-test_src = row.get("test_source") or (get_source_content(project_name, test_path) if test_path else "")
-
-st.subheader("🧾 Test Source")
-st.caption(f"Resolved test_path: {test_path}  ({test_path_note})")
-if not test_src:
-    st.warning("⚠️ No test source content found in DB for this case.")
-else:
-    st.code(test_src, language="java")
-
-# Dependencies
-st.subheader("🔗 Dependency Sources (from DB:test_dependencies + source_files)")
-deps = get_dependencies(project_name, test_path)
-if not deps:
-    st.caption("No dependencies found for this test_path.")
-else:
-    # optional: allow limit control
-    max_deps = st.number_input("Max dependency files to show", min_value=5, max_value=200, value=40, step=5)
-    for dp in deps[: int(max_deps)]:
-        with st.expander(dp):
-            st.code(get_source_content(project_name, dp), language="java")
-
-# Instantiations
-st.subheader("🧩 Object Instantiations (from DB:object_instantiations)")
-insts = get_object_instantiations(project_name, suite_basename, method_name)
-if not insts:
-    st.info("No instantiations found for this test case in DB (check suite_basename + method).")
-    st.stop()
-
-st.caption(f"Found {len(insts)} instantiation(s). Duplicates preserved via occurrence_in_case and inst_id.")
-
-inst_ids = [r["inst_id"] for r in insts]
-ann_map = load_annotations_for_inst_ids(inst_ids)
-
-# Rules
-rules = load_rules()
-rule_options: List[Tuple[str, int]] = []
-label_to_id: Dict[str, int] = {}
-for r in rules:
-    rid = int(r["id"])
-    label = f"{rid:02d} [{r.get('type','')}] {r.get('criterion','')} ({r.get('mock_decision','')})"
-    rule_options.append((label, rid))
-    label_to_id[label] = rid
-
-# Per-inst UI meta for case-level save
-case_inst_ui: List[Dict[str, Any]] = []
-
-for idx, inst in enumerate(insts):
-    inst_id = inst["inst_id"]
-    class_name = inst["class_name"]
-    occurrence = int(inst["occurrence_in_case"] or 0)
-    existing_mocked = inst.get("mocked", "")
-    testsuite_name = inst.get("test_suite", suite_basename)
-
-    ui_suffix = f"{inst_id}_{idx}"
-
-    prev = ann_map.get(inst_id, {})
-    default_dec = prev.get("decision", "uncertain")
-    default_note = (prev.get("notes") or "")
-
-    prev_rule_ids = prev.get("rule_ids") or []
-    if isinstance(prev_rule_ids, str):
-        try:
-            prev_rule_ids = json.loads(prev_rule_ids)
-        except Exception:
-            prev_rule_ids = []
-    prev_rule_ids = [int(x) for x in prev_rule_ids if str(x).isdigit()]
-    default_labels = [lab for (lab, rid) in rule_options if rid in prev_rule_ids]
-
-    with st.container(border=True):
-        st.markdown(
-            f"**[{idx+1}] Class:** `{class_name}`  |  "
-            f"**Occurrence:** `#{occurrence}`  |  "
-            f"**Existing Mocked:** `{existing_mocked}`"
-        )
-        st.caption(f"inst_id: {inst_id} | Test Suite: {testsuite_name}")
-
-        st.markdown("**Applicable Rules**")
-        st.multiselect(
-            "Select rules applied to this instantiation",
-            options=[lab for (lab, _) in rule_options],
-            default=default_labels,
-            key=f"rules_{ui_suffix}"
-        )
-
-        # Add rule (auto-refresh + auto-select)
-        with st.expander("➕ Add new rule"):
-            new_rule_type = st.selectbox("Type", ["Base Rule", "Extended Rule", "Other"], key=f"new_type_{ui_suffix}")
-            new_rule_cat = st.text_input("High Level Category", value="Class Characteristics", key=f"new_cat_{ui_suffix}")
-            new_rule_criterion = st.text_area("Criterion (when this rule applies)", key=f"new_criterion_{ui_suffix}")
-            new_rule_mock = st.text_input("Mock? (Yes / No / etc.)", value="Yes", key=f"new_mock_{ui_suffix}")
-
-            if st.button("💾 Add rule & select it", key=f"add_rule_{ui_suffix}"):
-                if new_rule_criterion.strip():
-                    created_by = st.session_state["user_name"]
-                    new_id = insert_rule(
-                        new_rule_type.strip(),
-                        new_rule_cat.strip(),
-                        new_rule_criterion.strip(),
-                        new_rule_mock.strip(),
-                        created_by,
-                    )
-                    # select immediately
-                    new_label = f"{new_id:02d} [{new_rule_type.strip()}] {new_rule_criterion.strip()} ({new_rule_mock.strip()})"
-                    multi_key = f"rules_{ui_suffix}"
-                    cur = st.session_state.get(multi_key, []) or []
-                    if new_label not in cur:
-                        st.session_state[multi_key] = cur + [new_label]
-
-                    # refresh cached rules/progress immediately
-                    st.cache_data.clear()
-                    st.success(f"Rule added: ID={new_id}")
-                    st.rerun()
-                else:
-                    st.warning("Criterion is required.")
-
-        st.radio(
-            f"Decision for `{class_name}` (#{occurrence})",
-            options=VALID_DECISIONS,
-            horizontal=True,
-            index=VALID_DECISIONS.index(default_dec) if default_dec in VALID_DECISIONS else 2,
-            key=f"dec_{ui_suffix}"
-        )
-        st.text_area(
-            f"Notes for `{class_name}` (#{occurrence})",
-            value=default_note,
-            height=80,
-            key=f"note_{ui_suffix}"
-        )
-
-        case_inst_ui.append({
-            "inst_id": inst_id,
-            "rules_state_key": f"rules_{ui_suffix}",
-            "dec_state_key": f"dec_{ui_suffix}",
-            "note_state_key": f"note_{ui_suffix}",
-        })
-
-# Case Actions
-st.subheader("✅ Case Actions")
-
-# Case progress (strict: decision != uncertain)
-labeled_insts = 0
-for meta in case_inst_ui:
-    prev = ann_map.get(meta["inst_id"])
-    if prev and prev.get("decision") and prev.get("decision") != "uncertain":
-        labeled_insts += 1
-
-st.progress(labeled_insts / len(case_inst_ui) if case_inst_ui else 0.0)
-st.caption(f"This case: labeled {labeled_insts} / {len(case_inst_ui)}")
-
-btn_c1, btn_c2 = st.columns([1, 1])
-with btn_c1:
-    save_all = st.button(
-        "💾 Save ALL instantiations",
-        key=f"save_all_{project_name}_{suite_basename}_{method_name}_{st.session_state.case_idx}"
-    )
-with btn_c2:
-    save_all_next = st.button(
-        "💾 Save ALL & Next Case",
-        key=f"save_all_next_{project_name}_{suite_basename}_{method_name}_{st.session_state.case_idx}"
+    st.subheader("📄 Test Case (Assigned)")
+    st.markdown(f"**Reviewer:** `{reviewer_id}`")
+    st.markdown(f"**Project:** `{project_name}`  |  **File:** `{file_col}`  |  **Method:** `{method_name}`")
+    st.caption(
+        f"TestAware: {row.get('testaware')} | "
+        f"MockIntensity: {row.get('mockintensity')} | "
+        f"DependencyCount: {safe_int(row.get('dependencycount'))} | "
+        f"CCTR_Bin: {row.get('cctr_bin')}"
     )
 
-def build_recs_for_case() -> List[Dict[str, Any]]:
-    recs = []
-    for meta in case_inst_ui:
-        selected_labels = st.session_state.get(meta["rules_state_key"], []) or []
-        selected_rule_ids = [label_to_id.get(lab) for lab in selected_labels if lab in label_to_id]
-        selected_rule_ids = [int(rid) for rid in selected_rule_ids if isinstance(rid, int)]
+    # test source + deps
+    test_path, test_path_note = resolve_test_path(project_name, row)
+    test_src = row.get("test_source") or (get_source_content(project_name, test_path) if test_path else "")
 
-        decision = st.session_state.get(meta["dec_state_key"], "uncertain")
-        notes = st.session_state.get(meta["note_state_key"], "")
+    st.subheader("🧾 Test Source")
+    st.caption(f"Resolved test_path: {test_path}  ({test_path_note})")
+    if test_src:
+        st.code(test_src, language="java")
+    else:
+        st.warning("No test source content found.")
 
-        recs.append({
-            "inst_id": meta["inst_id"],
-            "decision": decision,
-            "notes": notes,
-            "rule_ids": selected_rule_ids,
-            "rule_labels": selected_labels,
-        })
-    return recs
+    st.subheader("🔗 Dependencies")
+    deps = get_dependencies(project_name, test_path)
+    if deps:
+        max_deps = st.number_input("Max dependency files to show", min_value=5, max_value=200, value=40, step=5)
+        for dp in deps[: int(max_deps)]:
+            with st.expander(dp):
+                st.code(get_source_content(project_name, dp), language="java")
+    else:
+        st.caption("No dependencies found for this test.")
 
-if save_all or save_all_next:
-    updated_by = st.session_state["user_name"]
-    recs = build_recs_for_case()
+    # instantiations for this case, filtered to assigned
+    st.subheader("🧩 Your Assigned Instantiations in This Case")
+    insts_all = get_instantiations_for_case(project_name, suite_basename, method_name)
+    insts = filter_insts_to_assigned(insts_all, reviewer_id)
 
-    for r in recs:
-        upsert_annotation(
-            inst_id=r["inst_id"],
-            decision=r["decision"],
-            notes=r["notes"],
-            rule_ids=r["rule_ids"],
-            rule_labels=r["rule_labels"],
-            updated_by=updated_by,
-        )
+    if not insts:
+        st.info("No instantiations assigned to you in this case (it can happen). Click Next Case.")
+        st.stop()
 
-    st.cache_data.clear()
-    st.success(f"Saved {len(recs)} instantiation(s).")
+    inst_ids = [x["inst_id"] for x in insts]
+    ann_map = load_annotations_cv(inst_ids, reviewer_id)
 
-    if save_all_next and st.session_state.case_idx < total_cases - 1:
-        st.session_state.case_idx += 1
-    st.rerun()
+    # rules
+    rules = load_rules()
+    rule_options: List[Tuple[str, int]] = []
+    label_to_id: Dict[str, int] = {}
+    for r in rules:
+        rid = int(r["id"])
+        label = f"{rid:02d} [{r.get('type','')}] {r.get('criterion','')} ({r.get('mock_decision','')})"
+        rule_options.append((label, rid))
+        label_to_id[label] = rid
+
+    case_inst_ui: List[Dict[str, Any]] = []
+
+    for idx, inst in enumerate(insts):
+        inst_id = inst["inst_id"]
+        class_name = inst["class_name"]
+        occurrence = safe_int(inst.get("occurrence_in_case"), 0)
+        existing_mocked = inst.get("mocked", "")
+        ui_suffix = f"{inst_id}_{idx}"
+
+        prev = ann_map.get(inst_id, {})
+        default_dec = prev.get("decision", "uncertain")
+        default_note = prev.get("notes", "") or ""
+
+        prev_rule_ids = prev.get("rule_ids") or []
+        if isinstance(prev_rule_ids, str):
+            try:
+                prev_rule_ids = json.loads(prev_rule_ids)
+            except Exception:
+                prev_rule_ids = []
+        prev_rule_ids = [int(x) for x in prev_rule_ids if str(x).isdigit()]
+        default_labels = [lab for (lab, rid) in rule_options if rid in prev_rule_ids]
+
+        with st.container(border=True):
+            st.markdown(
+                f"**[{idx+1}] Class:** `{class_name}`  |  "
+                f"**Occurrence:** `#{occurrence}`  |  "
+                f"**Existing Mocked:** `{existing_mocked}`"
+            )
+            st.caption(f"inst_id: {inst_id}")
+
+            st.multiselect(
+                "Applicable rules",
+                options=[lab for (lab, _) in rule_options],
+                default=default_labels,
+                key=f"rules_{ui_suffix}",
+            )
+
+            with st.expander("➕ Add new rule"):
+                new_rule_type = st.selectbox("Type", ["Base Rule", "Extended Rule", "Other"], key=f"new_type_{ui_suffix}")
+                new_rule_cat = st.text_input("High Level Category", value="Class Characteristics", key=f"new_cat_{ui_suffix}")
+                new_rule_criterion = st.text_area("Criterion", key=f"new_criterion_{ui_suffix}")
+                new_rule_mock = st.text_input("Mock? (Yes/No/etc.)", value="Yes", key=f"new_mock_{ui_suffix}")
+
+                if st.button("💾 Add rule & select it", key=f"add_rule_{ui_suffix}"):
+                    if new_rule_criterion.strip():
+                        new_id = insert_rule(
+                            new_rule_type.strip(),
+                            new_rule_cat.strip(),
+                            new_rule_criterion.strip(),
+                            new_rule_mock.strip(),
+                            created_by=reviewer_id,
+                        )
+                        new_label = f"{new_id:02d} [{new_rule_type.strip()}] {new_rule_criterion.strip()} ({new_rule_mock.strip()})"
+                        mk = f"rules_{ui_suffix}"
+                        cur = st.session_state.get(mk, []) or []
+                        if new_label not in cur:
+                            st.session_state[mk] = cur + [new_label]
+                        st.cache_data.clear()
+                        st.success(f"Rule added: ID={new_id}")
+                        st.rerun()
+                    else:
+                        st.warning("Criterion is required.")
+
+            st.radio(
+                "Decision",
+                options=VALID_DECISIONS,
+                horizontal=True,
+                index=VALID_DECISIONS.index(default_dec) if default_dec in VALID_DECISIONS else 2,
+                key=f"dec_{ui_suffix}",
+            )
+            st.text_area("Notes", value=default_note, height=80, key=f"note_{ui_suffix}")
+
+            case_inst_ui.append(
+                {
+                    "inst_id": inst_id,
+                    "rules_key": f"rules_{ui_suffix}",
+                    "dec_key": f"dec_{ui_suffix}",
+                    "note_key": f"note_{ui_suffix}",
+                }
+            )
+
+    # Case actions
+    st.subheader("✅ Case Actions")
+
+    # case progress for this reviewer
+    labeled_case = sum(1 for inst_id in inst_ids if (ann_map.get(inst_id) and ann_map[inst_id].get("decision") != "uncertain"))
+    st.progress(labeled_case / len(inst_ids) if inst_ids else 0.0)
+    st.caption(f"This case (your assigned insts): labeled {labeled_case} / {len(inst_ids)}")
+
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        save_all = st.button("💾 Save ALL", key=f"save_all_{reviewer_id}_{project_name}_{suite_basename}_{method_name}_{st.session_state.case_idx}")
+    with b2:
+        save_next = st.button("💾 Save ALL & Next Case", key=f"save_next_{reviewer_id}_{project_name}_{suite_basename}_{method_name}_{st.session_state.case_idx}")
+
+    def collect_recs() -> List[Dict[str, Any]]:
+        recs = []
+        for meta in case_inst_ui:
+            selected_labels = st.session_state.get(meta["rules_key"], []) or []
+            selected_rule_ids = [label_to_id.get(lab) for lab in selected_labels if lab in label_to_id]
+            selected_rule_ids = [int(x) for x in selected_rule_ids if isinstance(x, int)]
+
+            decision = st.session_state.get(meta["dec_key"], "uncertain")
+            notes = st.session_state.get(meta["note_key"], "")
+
+            recs.append(
+                {
+                    "inst_id": meta["inst_id"],
+                    "decision": decision,
+                    "notes": notes,
+                    "rule_ids": selected_rule_ids,
+                    "rule_labels": selected_labels,
+                }
+            )
+        return recs
+
+    if save_all or save_next:
+        recs = collect_recs()
+        for r in recs:
+            upsert_annotation_cv(
+                inst_id=r["inst_id"],
+                reviewer_id=reviewer_id,
+                decision=r["decision"],
+                notes=r["notes"],
+                rule_ids=r["rule_ids"],
+                rule_labels=r["rule_labels"],
+                updated_by=reviewer_id,
+            )
+        st.cache_data.clear()
+        st.success(f"Saved {len(recs)} instantiation(s).")
+
+        if save_next and st.session_state.case_idx < len(cases) - 1:
+            st.session_state.case_idx += 1
+        st.rerun()
+
+    st.stop()
+
+
+# ---------- Compare ----------
+if mode == "Compare":
+    st.subheader("📊 Compare (gold vs reviewer)")
+
+    # reviewer list based on assignments (excluding gold)
+    revs = db_fetchall("select distinct reviewer_id from assignments order by reviewer_id")
+    revs = [r["reviewer_id"] for r in revs if r["reviewer_id"] != GOLD_REVIEWER_ID]
+
+    sel = st.selectbox("Select reviewer", options=revs, index=0 if revs else None)
+    if not sel:
+        st.info("No reviewers found in assignments yet. Create assignments in Admin mode.")
+        st.stop()
+
+    df = compare_gold_vs_reviewer(sel)
+    if df.empty:
+        st.warning("No comparable rows found. Check that assignments exist and gold labels are imported.")
+        st.stop()
+
+    # Metrics
+    total = len(df)
+    have_reviewer = df["reviewer_decision"].notna().sum()
+    have_gold = df["gold_decision"].notna().sum()
+    agree = df["agree"].sum()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total assigned insts", total)
+    c2.metric("Reviewer labeled", int(have_reviewer))
+    c3.metric("Gold available", int(have_gold))
+    c4.metric("Agreements", int(agree))
+
+    denom = max(int(have_reviewer), 1)
+    st.caption(f"Agreement rate (among reviewer-labeled rows): {agree/denom:.3f}")
+
+    st.subheader("Confusion matrix (gold vs reviewer)")
+    cm = confusion_matrix(df)
+    st.dataframe(cm, use_container_width=True)
+
+    st.subheader("Disagreements")
+    only_disagree = df[(df["reviewer_decision"].notna()) & (df["gold_decision"].notna()) & (df["agree"] == False)].copy()
+    st.caption(f"Disagreements (both labeled): {len(only_disagree)}")
+    st.dataframe(only_disagree.head(500), use_container_width=True)
+
+    st.subheader("Export")
+    st.download_button(
+        "⬇️ Download full comparison CSV",
+        data=to_csv_download(df),
+        file_name=f"compare_gold_vs_{sel}.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "⬇️ Download disagreements CSV",
+        data=to_csv_download(only_disagree),
+        file_name=f"disagreements_gold_vs_{sel}.csv",
+        mime="text/csv",
+    )
+
+    st.stop()
