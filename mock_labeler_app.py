@@ -19,7 +19,8 @@ Secrets:
 
 import json
 from typing import Dict, List, Any, Optional, Tuple
-
+import re
+import html
 import streamlit as st
 import pandas as pd
 import psycopg2
@@ -76,6 +77,142 @@ def safe_int(x: Any, default: int = 0) -> int:
         return int(x)
     except Exception:
         return default
+
+import re
+import html
+
+def java_class_name_from_path(p: str) -> str:
+    """
+    Show only class name for a java file path.
+    Example:
+      .../src/main/java/org/foo/BarBaz.java -> BarBaz
+    Fallback: basename without extension.
+    """
+    if not p:
+        return ""
+    p = str(p).replace("\\", "/")
+    base = p.split("/")[-1]
+    if base.lower().endswith(".java"):
+        base = base[:-5]
+    return base
+
+
+def extract_java_method(src: str, method_name: str, max_chars: int = 20000) -> str:
+    """
+    Best-effort extraction of a Java method body by method name (for test methods).
+    Returns the full method including signature + body.
+
+    This is not a full Java parser, but works well for typical JUnit tests.
+    """
+    if not src or not method_name:
+        return ""
+
+    s = src
+    if len(s) > max_chars:
+        s = s[:max_chars]
+
+    name = re.escape(method_name)
+
+    # More conservative pattern:
+    # - allow annotations above
+    # - allow common modifiers
+    # - find "... methodName(...) ... {"
+    # NOTE: We avoid verbose triple-quoted regex to prevent IDE parser issues.
+    pat = re.compile(
+        r"(?:^[ \t]*@.*\n)*"                 # annotations (0+ lines)
+        r"^[ \t]*"                           # line start
+        r"(?:(?:public|protected|private)\s+)?"  # optional access
+        r"(?:(?:static)\s+)?"                # optional static
+        r"(?:(?:final)\s+)?"                 # optional final
+        r"(?:(?:synchronized)\s+)?"          # optional synchronized
+        r"(?:<[^>]+>\s+)?"                   # optional generics
+        r"[\w\[\]<>.,]+\s+"                  # return type (simple)
+        r"(" + name + r")"                   # method name
+        r"\s*\([^;]*\)"                      # params (not containing ';')
+        r"(?:\s*throws\s*[^{]+)?"             # optional throws
+        r"\s*\{",                             # opening brace
+        flags=re.MULTILINE
+    )
+
+    m = pat.search(s)
+    if not m:
+        # fallback: search for "methodName(" then find nearest "{" after it
+        idx = s.find(method_name + "(")
+        if idx < 0:
+            return ""
+        brace = s.find("{", idx)
+        if brace < 0:
+            return ""
+        start = max(s.rfind("\n", 0, idx), 0)
+    else:
+        start = m.start()
+        brace = s.find("{", m.end() - 1)
+        if brace < 0:
+            return ""
+
+    # Brace matching from first "{"
+    i = brace
+    depth = 0
+    in_str = False
+    in_chr = False
+    escape = False
+
+    while i < len(s):
+        ch = s[i]
+
+        if escape:
+            escape = False
+            i += 1
+            continue
+
+        if ch == "\\" and (in_str or in_chr):
+            escape = True
+            i += 1
+            continue
+
+        if ch == '"' and not in_chr:
+            in_str = not in_str
+            i += 1
+            continue
+
+        if ch == "'" and not in_str:
+            in_chr = not in_chr
+            i += 1
+            continue
+
+        if not in_str and not in_chr:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    return s[start:end].strip()
+
+        i += 1
+
+    return ""
+
+
+def highlight_method_in_source_html(full_src: str, method_src: str) -> str:
+    """
+    Render full source as HTML <pre><code> with method_src highlighted.
+    """
+    if not full_src:
+        return "<pre><code></code></pre>"
+
+    esc_full = html.escape(full_src)
+
+    if method_src and method_src in full_src:
+        esc_method = html.escape(method_src)
+        # highlight first occurrence
+        esc_full = esc_full.replace(
+            esc_method,
+            f'<span class="hl">{esc_method}</span>',
+            1
+        )
+
+    return f"<pre class='code'><code>{esc_full}</code></pre>"
 
 
 # ===================== Sampled scope (instantiations under sampled_tests) =====================
@@ -526,6 +663,29 @@ def to_csv_download(df: pd.DataFrame) -> bytes:
 
 st.set_page_config(page_title="Mock Labeler (Cross-validation)", layout="wide")
 st.title("🧪 Mock Labeler (Cross-validation)")
+st.markdown(
+    """
+    <style>
+      pre.code {
+        white-space: pre;
+        overflow-x: auto;
+        padding: 0.75rem;
+        border-radius: 0.5rem;
+        background: #0e1117;
+        color: #d7dae0;
+        border: 1px solid rgba(255,255,255,0.08);
+        font-size: 0.85rem;
+        line-height: 1.25rem;
+      }
+      .hl {
+        background: rgba(255, 230, 0, 0.25);
+        outline: 1px solid rgba(255, 230, 0, 0.35);
+        border-radius: 3px;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.header("Mode")
@@ -705,21 +865,42 @@ if mode == "Review":
     test_src = row.get("test_source") or (get_source_content(project_name, test_path) if test_path else "")
 
     st.subheader("🧾 Test Source")
-    st.caption(f"Resolved test_path: {test_path}  ({test_path_note})")
-    if test_src:
-        st.code(test_src, language="java")
-    else:
-        st.warning("No test source content found.")
 
-    st.subheader("🔗 Dependencies")
-    deps = get_dependencies(project_name, test_path)
-    if deps:
-        max_deps = st.number_input("Max dependency files to show", min_value=5, max_value=200, value=40, step=5)
-        for dp in deps[: int(max_deps)]:
-            with st.expander(dp):
-                st.code(get_source_content(project_name, dp), language="java")
+    test_path, test_path_note = resolve_test_path(project_name, row)
+    test_src_full = row.get("test_source") or (get_source_content(project_name, test_path) if test_path else "")
+
+    st.caption(f"Resolved test_path: {test_path}  ({test_path_note})")
+
+    if not test_src_full:
+        st.warning("No test source content found.")
     else:
-        st.caption("No dependencies found for this test.")
+        # Extract current method only
+        method_src = extract_java_method(test_src_full, method_name)
+
+        if method_src:
+            st.caption(f"Showing current test case only: `{method_name}`")
+            st.code(method_src, language="java")
+        else:
+            st.warning(f"Could not extract method `{method_name}`; showing top of file.")
+            st.code(test_src_full[:4000], language="java")
+
+        # toggle full source
+        toggle_key = f"show_full_test_{reviewer_id}_{project_name}_{suite_basename}_{method_name}"
+        if toggle_key not in st.session_state:
+            st.session_state[toggle_key] = False
+
+        cbtn1, cbtn2 = st.columns([1, 6])
+        with cbtn1:
+            if st.button(
+                    "Show full test suite" if not st.session_state[toggle_key] else "Hide full test suite",
+                    key=f"btn_{toggle_key}"
+            ):
+                st.session_state[toggle_key] = not st.session_state[toggle_key]
+
+        if st.session_state[toggle_key]:
+            st.caption("Full test suite (highlighting current test case)")
+            html_block = highlight_method_in_source_html(test_src_full, method_src)
+            st.markdown(html_block, unsafe_allow_html=True)
 
     st.subheader("🧩 Your Assigned Instantiations in This Case")
     insts_all = get_instantiations_for_case(project_name, suite_basename, method_name)
