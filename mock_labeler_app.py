@@ -97,101 +97,244 @@ def java_class_name_from_path(p: str) -> str:
     return base
 
 
-def extract_java_method(src: str, method_name: str, max_chars: int = 20000) -> str:
+def extract_java_method(src: str, method_name: str, max_chars: int = 200000) -> str:
     """
-    Best-effort extraction of a Java method body by method name (for test methods).
-    Returns the full method including signature + body.
+    Robust extraction of a Java method declaration by name.
 
-    This is not a full Java parser, but works well for typical JUnit tests.
+    Strategy:
+    - find occurrences of 'methodName('
+    - filter out likely invocations (preceded by '.' or part of identifier)
+    - parse matching ')' for the parameter list
+    - skip whitespace + optional 'throws ...'
+    - require next significant token to be '{'
+    - then brace-match to capture full method body
+
+    Not a full Java parser, but works well for most test suites.
     """
     if not src or not method_name:
         return ""
 
-    s = src
-    if len(s) > max_chars:
-        s = s[:max_chars]
+    s = src[:max_chars] if len(src) > max_chars else src
+    needle = method_name + "("
 
-    name = re.escape(method_name)
+    def is_ident_char(ch: str) -> bool:
+        return ch.isalnum() or ch in ["_", "$"]
 
-    # More conservative pattern:
-    # - allow annotations above
-    # - allow common modifiers
-    # - find "... methodName(...) ... {"
-    # NOTE: We avoid verbose triple-quoted regex to prevent IDE parser issues.
-    pat = re.compile(
-        r"(?:^[ \t]*@.*\n)*"                 # annotations (0+ lines)
-        r"^[ \t]*"                           # line start
-        r"(?:(?:public|protected|private)\s+)?"  # optional access
-        r"(?:(?:static)\s+)?"                # optional static
-        r"(?:(?:final)\s+)?"                 # optional final
-        r"(?:(?:synchronized)\s+)?"          # optional synchronized
-        r"(?:<[^>]+>\s+)?"                   # optional generics
-        r"[\w\[\]<>.,]+\s+"                  # return type (simple)
-        r"(" + name + r")"                   # method name
-        r"\s*\([^;]*\)"                      # params (not containing ';')
-        r"(?:\s*throws\s*[^{]+)?"             # optional throws
-        r"\s*\{",                             # opening brace
-        flags=re.MULTILINE
-    )
+    def skip_ws_and_comments(i: int) -> int:
+        """Skip whitespace and //... or /*...*/ comments."""
+        n = len(s)
+        while i < n:
+            if s[i].isspace():
+                i += 1
+                continue
+            # line comment
+            if s.startswith("//", i):
+                j = s.find("\n", i + 2)
+                return n if j == -1 else j + 1
+            # block comment
+            if s.startswith("/*", i):
+                j = s.find("*/", i + 2)
+                if j == -1:
+                    return n
+                i = j + 2
+                continue
+            break
+        return i
 
-    m = pat.search(s)
-    if not m:
-        # fallback: search for "methodName(" then find nearest "{" after it
-        idx = s.find(method_name + "(")
-        if idx < 0:
-            return ""
-        brace = s.find("{", idx)
-        if brace < 0:
-            return ""
-        start = max(s.rfind("\n", 0, idx), 0)
-    else:
-        start = m.start()
-        brace = s.find("{", m.end() - 1)
-        if brace < 0:
-            return ""
+    def find_matching_paren(open_paren_idx: int) -> int:
+        """Given index of '(', find matching ')' considering strings/chars."""
+        i = open_paren_idx
+        n = len(s)
+        depth = 0
+        in_str = False
+        in_chr = False
+        escape = False
+        while i < n:
+            ch = s[i]
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if (in_str or in_chr) and ch == "\\":
+                escape = True
+                i += 1
+                continue
+            if ch == '"' and not in_chr:
+                in_str = not in_str
+                i += 1
+                continue
+            if ch == "'" and not in_str:
+                in_chr = not in_chr
+                i += 1
+                continue
 
-    # Brace matching from first "{"
-    i = brace
-    depth = 0
-    in_str = False
-    in_chr = False
-    escape = False
+            if not in_str and not in_chr:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+            i += 1
+        return -1
 
-    while i < len(s):
-        ch = s[i]
+    def find_open_brace(after_idx: int) -> int:
+        """
+        Find the '{' that starts the method body after the parameter list.
+        Allows: whitespace/comments + optional 'throws ...' (possibly multi-token) before '{'
+        """
+        i = skip_ws_and_comments(after_idx)
 
-        if escape:
+        # optional "throws ..."
+        if s.startswith("throws", i) and (i == 0 or not is_ident_char(s[i - 1])) and (i + 6 >= len(s) or not is_ident_char(s[i + 6])):
+            i += 6
+            # scan until we hit '{' or ';' (abstract/interface method) or end
+            n = len(s)
+            in_str = False
+            in_chr = False
             escape = False
+            while i < n:
+                i = skip_ws_and_comments(i)
+                if i >= n:
+                    break
+                ch = s[i]
+                if escape:
+                    escape = False
+                    i += 1
+                    continue
+                if (in_str or in_chr) and ch == "\\":
+                    escape = True
+                    i += 1
+                    continue
+                if ch == '"' and not in_chr:
+                    in_str = not in_str
+                    i += 1
+                    continue
+                if ch == "'" and not in_str:
+                    in_chr = not in_chr
+                    i += 1
+                    continue
+                if not in_str and not in_chr:
+                    if ch == "{":
+                        return i
+                    if ch == ";":
+                        return -1
+                i += 1
+
+        i = skip_ws_and_comments(i)
+        return i if i < len(s) and s[i] == "{" else -1
+
+    def find_matching_brace(open_brace_idx: int) -> int:
+        """Given index of '{', find matching '}' considering strings/chars."""
+        i = open_brace_idx
+        n = len(s)
+        depth = 0
+        in_str = False
+        in_chr = False
+        escape = False
+        while i < n:
+            ch = s[i]
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if (in_str or in_chr) and ch == "\\":
+                escape = True
+                i += 1
+                continue
+            if ch == '"' and not in_chr:
+                in_str = not in_str
+                i += 1
+                continue
+            if ch == "'" and not in_str:
+                in_chr = not in_chr
+                i += 1
+                continue
+
+            if not in_str and not in_chr:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return i
             i += 1
+        return -1
+
+    # iterate all occurrences
+    start_search = 0
+    while True:
+        idx = s.find(needle, start_search)
+        if idx == -1:
+            break
+
+        name_start = idx
+        name_end = idx + len(method_name)
+
+        # Filter out invocations like obj.methodName( or Class.methodName(
+        prev = s[name_start - 1] if name_start - 1 >= 0 else ""
+        if prev == ".":
+            start_search = idx + 1
             continue
 
-        if ch == "\\" and (in_str or in_chr):
-            escape = True
-            i += 1
+        # Ensure method name is not part of a larger identifier
+        if prev and is_ident_char(prev):
+            start_search = idx + 1
             continue
 
-        if ch == '"' and not in_chr:
-            in_str = not in_str
-            i += 1
+        # Parse params
+        open_paren = name_end
+        close_paren = find_matching_paren(open_paren)
+        if close_paren == -1:
+            start_search = idx + 1
             continue
 
-        if ch == "'" and not in_str:
-            in_chr = not in_chr
-            i += 1
+        # Find body '{'
+        open_brace = find_open_brace(close_paren + 1)
+        if open_brace == -1:
+            start_search = idx + 1
             continue
 
-        if not in_str and not in_chr:
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    return s[start:end].strip()
+        close_brace = find_matching_brace(open_brace)
+        if close_brace == -1:
+            start_search = idx + 1
+            continue
 
-        i += 1
+        # choose a reasonable start: beginning of the line that contains the declaration
+        line_start = s.rfind("\n", 0, name_start)
+        if line_start == -1:
+            line_start = 0
+        else:
+            line_start += 1
+
+        return s[line_start:close_brace + 1].strip()
+
+        # next
+        start_search = idx + 1
 
     return ""
+
+def add_markers_around_method(full_src: str, method_src: str, method_name: str) -> str:
+    """
+    Insert visible comment markers around the first occurrence of method_src in full_src.
+    Keeps st.code() syntax highlighting.
+    """
+    if not full_src:
+        return ""
+    if not method_src:
+        return full_src
+
+    start_marker = f"// >>>>>>> CURRENT REVIEW TEST CASE: {method_name} >>>>>>>"
+    end_marker   = f"// <<<<<<< END CURRENT REVIEW TEST CASE: {method_name} <<<<<<<"
+
+    idx = full_src.find(method_src)
+    if idx < 0:
+        return full_src
+
+    before = full_src[:idx].rstrip("\n")
+    after = full_src[idx + len(method_src):].lstrip("\n")
+
+    return f"{before}\n{start_marker}\n{method_src}\n{end_marker}\n{after}"
 
 
 def highlight_method_in_source_html(full_src: str, method_src: str) -> str:
@@ -663,29 +806,6 @@ def to_csv_download(df: pd.DataFrame) -> bytes:
 
 st.set_page_config(page_title="Mock Labeler (Cross-validation)", layout="wide")
 st.title("🧪 Mock Labeler (Cross-validation)")
-st.markdown(
-    """
-    <style>
-      pre.code {
-        white-space: pre;
-        overflow-x: auto;
-        padding: 0.75rem;
-        border-radius: 0.5rem;
-        background: #0e1117;
-        color: #d7dae0;
-        border: 1px solid rgba(255,255,255,0.08);
-        font-size: 0.85rem;
-        line-height: 1.25rem;
-      }
-      .hl {
-        background: rgba(255, 230, 0, 0.25);
-        outline: 1px solid rgba(255, 230, 0, 0.35);
-        border-radius: 3px;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 with st.sidebar:
     st.header("Mode")
@@ -697,7 +817,7 @@ with st.sidebar:
         value=st.session_state.get("reviewer_id", "")
     ).strip()
     st.session_state["reviewer_id"] = reviewer_id
-    st.caption("Tip: input 'gold' to view/edit gold labels in Review mode.")
+    # st.caption("Tip: input 'gold' to view/edit gold labels in Review mode.")
 
 
 # ---------- Admin ----------
@@ -869,38 +989,37 @@ if mode == "Review":
     test_path, test_path_note = resolve_test_path(project_name, row)
     test_src_full = row.get("test_source") or (get_source_content(project_name, test_path) if test_path else "")
 
-    st.caption(f"Resolved test_path: {test_path}  ({test_path_note})")
+    # st.caption(f"Resolved test_path: {test_path}  ({test_path_note})")
 
     if not test_src_full:
         st.warning("No test source content found.")
     else:
-        # Extract current method only
         method_src = extract_java_method(test_src_full, method_name)
 
-        if method_src:
-            st.caption(f"Showing current test case only: `{method_name}`")
-            st.code(method_src, language="java")
-        else:
-            st.warning(f"Could not extract method `{method_name}`; showing top of file.")
-            st.code(test_src_full[:4000], language="java")
-
-        # toggle full source
         toggle_key = f"show_full_test_{reviewer_id}_{project_name}_{suite_basename}_{method_name}"
         if toggle_key not in st.session_state:
             st.session_state[toggle_key] = False
 
-        cbtn1, cbtn2 = st.columns([1, 6])
-        with cbtn1:
-            if st.button(
-                    "Show full test suite" if not st.session_state[toggle_key] else "Hide full test suite",
-                    key=f"btn_{toggle_key}"
-            ):
-                st.session_state[toggle_key] = not st.session_state[toggle_key]
+        # If we failed to extract method, fallback = show full suite directly
+        if not method_src:
+            st.warning(f"Could not extract method `{method_name}`. Showing full test suite.")
+            st.session_state[toggle_key] = True
 
+        # Default view: show current method only (if extracted)
+        if method_src and not st.session_state[toggle_key]:
+            st.caption(f"Showing current test case only: `{method_name}`")
+            st.code(method_src, language="java")
+
+        # Toggle button
+        btn_label = "Show full test suite" if not st.session_state[toggle_key] else "Hide full test suite"
+        if st.button(btn_label, key=f"btn_{toggle_key}"):
+            st.session_state[toggle_key] = not st.session_state[toggle_key]
+
+        # Full suite view (syntax-highlighted)
         if st.session_state[toggle_key]:
-            st.caption("Full test suite (highlighting current test case)")
-            html_block = highlight_method_in_source_html(test_src_full, method_src)
-            st.markdown(html_block, unsafe_allow_html=True)
+            st.caption("Full test suite (method is marked with comment banners)")
+            marked_src = add_markers_around_method(test_src_full, method_src, method_name)
+            st.code(marked_src, language="java")
 
     st.subheader("🧩 Your Assigned Instantiations in This Case")
     insts_all = get_instantiations_for_case(project_name, suite_basename, method_name)
@@ -953,7 +1072,7 @@ if mode == "Review":
             st.markdown(
                 f"**[{idx+1}] Class:** `{class_name}`  |  "
                 f"**Occurrence:** `#{occurrence}`  |  "
-                f"**Existing Mocked:** `{existing_mocked}`"
+                # f"**Existing Mocked:** `{existing_mocked}`"
             )
             st.caption(f"inst_id: {inst_id}")
 
