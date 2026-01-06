@@ -148,6 +148,29 @@ def get_sampled_cases_for_reviewer(reviewer_id: str) -> List[Dict[str, Any]]:
     )
     return rows
 
+@st.cache_data(show_spinner=False)
+def get_sampled_cases_all() -> List[Dict[str, Any]]:
+    """
+    All sampled_tests cases (full sampled scope).
+    """
+    return db_fetchall(
+        """
+        select
+          st.id,
+          st.project,
+          st.file,
+          st.method,
+          regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+          st.testaware,
+          st.mockintensity,
+          st.dependencycount,
+          st.cctr_bin,
+          st.test_file_path,
+          st.test_source
+        from sampled_tests st
+        order by st.id
+        """
+    )
 
 def get_instantiations_for_case(project: str, suite_basename: str, method: str) -> List[Dict[str, Any]]:
     return db_fetchall(
@@ -574,15 +597,68 @@ if mode == "Review":
         st.warning("Please input your reviewer_id in the sidebar.")
         st.stop()
 
-    # progress (works for gold too if you assign gold tasks)
-    labeled, total = get_reviewer_progress(reviewer_id)
     st.sidebar.header("Your progress")
+
+    if reviewer_id == GOLD_REVIEWER_ID:
+        # total = all instantiations under sampled scope
+        total_row = db_fetchone(
+            """
+            with stf as (
+              select
+                st.project,
+                regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+                st.method
+              from sampled_tests st
+            )
+            select count(*) as n
+            from object_instantiations oi
+            join stf
+              on stf.project = oi.project
+             and stf.suite_basename = oi.test_suite_basename
+             and stf.method = oi.test_case
+            """
+        )
+        total = int((total_row or {}).get("n") or 0)
+
+        labeled_row = db_fetchone(
+            """
+            with stf as (
+              select
+                st.project,
+                regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+                st.method
+              from sampled_tests st
+            ),
+            scope as (
+              select oi.inst_id
+              from object_instantiations oi
+              join stf
+                on stf.project = oi.project
+               and stf.suite_basename = oi.test_suite_basename
+               and stf.method = oi.test_case
+            )
+            select count(*) as n
+            from annotations_cv ac
+            join scope s on s.inst_id = ac.inst_id
+            where ac.reviewer_id = %s and ac.decision <> 'uncertain'
+            """,
+            (GOLD_REVIEWER_ID,),
+        )
+        labeled = int((labeled_row or {}).get("n") or 0)
+    else:
+        labeled, total = get_reviewer_progress(reviewer_id)
+
     st.sidebar.progress((labeled / total) if total else 0.0)
     st.sidebar.caption(f"{labeled} / {total} labeled (decision != uncertain)")
 
-    cases = get_sampled_cases_for_reviewer(reviewer_id)
+    # gold: can browse full sampled scope without assignments
+    if reviewer_id == GOLD_REVIEWER_ID:
+        cases = get_sampled_cases_all()
+    else:
+        cases = get_sampled_cases_for_reviewer(reviewer_id)
+
     if not cases:
-        st.info("No cases assigned to this reviewer_id yet. Create assignments in Admin mode.")
+        st.info("No cases available for this reviewer_id. For non-gold reviewers, ask admin to create assignments.")
         st.stop()
 
     if "case_idx" not in st.session_state:
@@ -647,10 +723,15 @@ if mode == "Review":
 
     st.subheader("🧩 Your Assigned Instantiations in This Case")
     insts_all = get_instantiations_for_case(project_name, suite_basename, method_name)
-    insts = filter_insts_to_assigned(insts_all, reviewer_id)
+
+    # gold: see all instantiations in sampled scope case
+    if reviewer_id == GOLD_REVIEWER_ID:
+        insts = insts_all
+    else:
+        insts = filter_insts_to_assigned(insts_all, reviewer_id)
 
     if not insts:
-        st.info("No instantiations assigned to you in this case (it can happen). Click Next Case.")
+        st.info("No instantiations available in this case for you. Click Next Case.")
         st.stop()
 
     inst_ids = [x["inst_id"] for x in insts]
