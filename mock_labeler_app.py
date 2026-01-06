@@ -25,6 +25,7 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2 import OperationalError, InterfaceError, DatabaseError
 
 VALID_DECISIONS = ["mock", "no-mock", "uncertain", "skip"]
 GOLD_REVIEWER_ID = "gold"
@@ -42,25 +43,98 @@ def get_conn():
     return conn
 
 
-def db_fetchall(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+
+def _conn_is_usable(conn) -> bool:
+    try:
+        if conn is None:
+            return False
+        if getattr(conn, "closed", 1) != 0:
+            return False
+        # lightweight ping
+        with conn.cursor() as cur:
+            cur.execute("select 1")
+            _ = cur.fetchone()
+        return True
+    except Exception:
+        return False
+
+
+def get_conn_safe():
+    """
+    Return a usable connection; if cached conn is stale, clear cache and reconnect.
+    """
     conn = get_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, params)
-        return list(cur.fetchall())
+    if _conn_is_usable(conn):
+        return conn
+
+    # cached conn is stale -> clear cached resource and rebuild
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+    conn = get_conn()
+    return conn
+
+def db_fetchall(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    for attempt in (1, 2):
+        try:
+            conn = get_conn_safe()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                return list(cur.fetchall())
+        except (OperationalError, InterfaceError) as e:
+            # stale connection
+            if attempt == 1:
+                try:
+                    st.cache_resource.clear()
+                except Exception:
+                    pass
+                continue
+            raise
+        except DatabaseError:
+            # real SQL error; don't retry silently
+            raise
+
 
 
 def db_fetchone(sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
-    conn = get_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, params)
-        row = cur.fetchone()
-        return dict(row) if row else None
+    for attempt in (1, 2):
+        try:
+            conn = get_conn_safe()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                return dict(row) if row else None
+        except (OperationalError, InterfaceError):
+            if attempt == 1:
+                try:
+                    st.cache_resource.clear()
+                except Exception:
+                    pass
+                continue
+            raise
+        except DatabaseError:
+            raise
 
 
 def db_execute(sql: str, params: tuple = ()) -> None:
-    conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
+    for attempt in (1, 2):
+        try:
+            conn = get_conn_safe()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            return
+        except (OperationalError, InterfaceError):
+            if attempt == 1:
+                try:
+                    st.cache_resource.clear()
+                except Exception:
+                    pass
+                continue
+            raise
+        except DatabaseError:
+            raise
 
 
 # ===================== Helpers =====================
@@ -672,7 +746,7 @@ def create_case_assignments_by_counts(
         cur += n
 
     if rows:
-        conn = get_conn()
+        conn = get_conn_safe()
         with conn.cursor() as cur2:
             execute_values(
                 cur2,
