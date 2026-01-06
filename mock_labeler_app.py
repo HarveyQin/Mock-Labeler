@@ -6,10 +6,10 @@ Cross-validation-ready Streamlit app:
 - Scope of review: ONLY object_instantiations that belong to sampled_tests
   (matched by project + suite_basename(file) + method(test_case))
 - Multi-reviewer annotations: annotations_cv(inst_id, reviewer_id)
-- Assignments: assignments(inst_id, reviewer_id, bucket) to split workload evenly
+- Assignments: assignments(inst_id, reviewer_id, bucket)
 
 Modes:
-- Review: reviewers label ONLY their assigned instantiations
+- Review: reviewers label ONLY their assigned instantiations (including gold if reviewer_id='gold')
 - Compare: compare reviewer vs gold and export disagreements
 - Admin: create/reset assignments and view counts
 
@@ -19,8 +19,6 @@ Secrets:
 
 import json
 from typing import Dict, List, Any, Optional, Tuple
-from io import StringIO
-import csv
 
 import streamlit as st
 import pandas as pd
@@ -86,6 +84,7 @@ def safe_int(x: Any, default: int = 0) -> int:
 def get_sampled_scope_inst_ids() -> List[str]:
     """
     Return all inst_id (uuid as text) that belong to sampled_tests scope.
+    Deterministic ordering for assignment slicing.
     """
     rows = db_fetchall(
         """
@@ -316,21 +315,33 @@ def resolve_test_path(project: str, sampled_test_row: Dict[str, Any]) -> Tuple[O
 
 # ===================== Assignments =====================
 
-def create_assignments_evenly(reviewer_ids: List[str]) -> Dict[str, int]:
+def create_assignments_by_counts(
+    reviewers_and_counts: List[Tuple[str, int]],
+    allow_partial: bool = True
+) -> Dict[str, Any]:
     """
-    Create/overwrite assignments for sampled_tests scope:
-    - Even round-robin across reviewer_ids
-    - Writes assignments(inst_id, reviewer_id, bucket)
+    Manually assign N instantiations to each reviewer in order (stable slicing).
+    reviewers_and_counts: [(reviewer_id, n), ...]
+    - If sum(n) < total and allow_partial=True: leftover will remain unassigned.
+    - If sum(n) > total: error.
+    Overwrites existing assignments for these reviewers within sampled scope inst_ids.
     """
-    reviewer_ids = [r.strip() for r in reviewer_ids if r and r.strip()]
-    if len(reviewer_ids) != 4:
-        raise ValueError("Please provide exactly 4 reviewer_ids.")
+    reviewers_and_counts = [(r.strip(), int(n)) for r, n in reviewers_and_counts if r and r.strip()]
+    if len(reviewers_and_counts) != 4:
+        raise ValueError("Please provide exactly 4 reviewers (each with a count).")
+
+    if any(n < 0 for _, n in reviewers_and_counts):
+        raise ValueError("Counts must be >= 0.")
 
     inst_ids = get_sampled_scope_inst_ids()
-    if not inst_ids:
-        raise RuntimeError("No instantiations found under sampled_tests scope.")
+    total_scope = len(inst_ids)
+    total_need = sum(n for _, n in reviewers_and_counts)
 
-    # We will overwrite existing assignments for these reviewers within the sampled scope
+    if total_need > total_scope:
+        raise ValueError(f"Requested {total_need} but sampled scope has only {total_scope} instantiations.")
+
+    # delete existing assignments for these reviewers within sampled scope
+    reviewer_ids = [r for r, _ in reviewers_and_counts]
     db_execute(
         """
         delete from assignments
@@ -340,32 +351,40 @@ def create_assignments_evenly(reviewer_ids: List[str]) -> Dict[str, int]:
         (reviewer_ids, inst_ids),
     )
 
+    # slice deterministically
     rows = []
-    for i, inst_id in enumerate(inst_ids):
-        bucket = (i % 4) + 1
-        reviewer = reviewer_ids[bucket - 1]
-        rows.append((inst_id, reviewer, bucket))
+    cur = 0
+    for idx, (reviewer, n) in enumerate(reviewers_and_counts):
+        bucket = idx + 1
+        take = inst_ids[cur: cur + n]
+        for inst_id in take:
+            rows.append((inst_id, reviewer, bucket))
+        cur += n
 
-    conn = get_conn()
-    with conn.cursor() as cur:
-        execute_values(
-            cur,
-            """
-            insert into assignments(inst_id, reviewer_id, bucket)
-            values %s
-            on conflict (inst_id, reviewer_id) do update
-              set bucket = excluded.bucket,
-                  assigned_at = now()
-            """,
-            rows,
-            page_size=1000,
-        )
+    if rows:
+        conn = get_conn()
+        with conn.cursor() as cur2:
+            execute_values(
+                cur2,
+                """
+                insert into assignments(inst_id, reviewer_id, bucket)
+                values %s
+                on conflict (inst_id, reviewer_id) do update
+                  set bucket = excluded.bucket,
+                      assigned_at = now()
+                """,
+                rows,
+                page_size=1000,
+            )
 
-    # counts
-    counts = {r: 0 for r in reviewer_ids}
-    for _, reviewer, _ in rows:
-        counts[reviewer] += 1
-    return counts
+    counts = {r: n for r, n in reviewers_and_counts}
+    leftover = total_scope - total_need
+    return {
+        "scope_total": total_scope,
+        "assigned_total": total_need,
+        "leftover_unassigned": leftover,
+        "per_reviewer_requested": counts,
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -381,11 +400,10 @@ def get_assignment_counts() -> List[Dict[str, Any]]:
 
 
 def get_reviewer_progress(reviewer_id: str) -> Tuple[int, int]:
-    """
-    Progress in sampled scope: assigned instantiations vs labeled (decision != 'uncertain')
-    """
-    total = db_fetchone("select count(*) as n from assignments where reviewer_id=%s", (reviewer_id,))["n"]
-    labeled = db_fetchone(
+    total_row = db_fetchone("select count(*) as n from assignments where reviewer_id=%s", (reviewer_id,))
+    total = int((total_row or {}).get("n") or 0)
+
+    labeled_row = db_fetchone(
         """
         select count(*) as n
         from assignments a
@@ -394,18 +412,14 @@ def get_reviewer_progress(reviewer_id: str) -> Tuple[int, int]:
         where a.reviewer_id=%s and ac.decision <> 'uncertain'
         """,
         (reviewer_id,),
-    )["n"]
-    return int(labeled), int(total)
+    )
+    labeled = int((labeled_row or {}).get("n") or 0)
+    return labeled, total
 
 
 # ===================== Compare =====================
 
 def compare_gold_vs_reviewer(reviewer_id: str) -> pd.DataFrame:
-    """
-    Return a dataframe with per-inst row under sampled scope and assigned-to-reviewer:
-    inst_id, project, suite_basename, test_case, class_name, occurrence,
-    gold_decision, reviewer_decision, agree
-    """
     rows = db_fetchall(
         """
         with stf as (
@@ -461,7 +475,6 @@ def compare_gold_vs_reviewer(reviewer_id: str) -> pd.DataFrame:
         """,
         (reviewer_id, GOLD_REVIEWER_ID, reviewer_id),
     )
-
     df = pd.DataFrame(rows)
     if df.empty:
         return df
@@ -472,11 +485,13 @@ def compare_gold_vs_reviewer(reviewer_id: str) -> pd.DataFrame:
 def confusion_matrix(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
-    # normalize missing to "MISSING"
     g = df["gold_decision"].fillna("MISSING")
     r = df["reviewer_decision"].fillna("MISSING")
     cats = VALID_DECISIONS + ["MISSING"]
-    mat = pd.crosstab(g, r, rownames=["gold"], colnames=["reviewer"], dropna=False).reindex(index=cats, columns=cats, fill_value=0)
+    mat = (
+        pd.crosstab(g, r, rownames=["gold"], colnames=["reviewer"], dropna=False)
+        .reindex(index=cats, columns=cats, fill_value=0)
+    )
     return mat
 
 
@@ -494,33 +509,51 @@ with st.sidebar:
     mode = st.radio("Choose mode", ["Review", "Compare", "Admin"], index=0)
 
     st.header("Identity")
-    reviewer_id = st.text_input("reviewer_id (email)", value=st.session_state.get("reviewer_id", "")).strip()
+    reviewer_id = st.text_input(
+        "reviewer_id (email or 'gold')",
+        value=st.session_state.get("reviewer_id", "")
+    ).strip()
     st.session_state["reviewer_id"] = reviewer_id
+    st.caption("Tip: input 'gold' to view/edit gold labels in Review mode.")
 
-    st.caption("Gold reviewer_id is fixed as 'gold'.")
 
 # ---------- Admin ----------
 if mode == "Admin":
-    st.subheader("🛠 Admin: Assignments")
+    st.subheader("🛠 Admin: Assignments (Manual counts)")
 
-    st.write("This will split **sampled_tests scope instantiations** into 4 equal buckets (round-robin).")
+    inst_ids = get_sampled_scope_inst_ids()
+    scope_total = len(inst_ids)
+    st.caption(f"Sampled scope instantiations: {scope_total}")
+
+    st.write("Provide **exactly 4** reviewers and how many instantiations each should review. "
+             "Assignments are created by deterministic slicing of the sampled-scope inst_id list.")
 
     c1, c2 = st.columns(2)
     with c1:
         r1 = st.text_input("Reviewer #1 (bucket 1)", value=st.session_state.get("r1", "")).strip()
+        n1 = st.number_input("Count #1", min_value=0, max_value=scope_total, value=int(st.session_state.get("n1", 0) or 0), step=1)
         r2 = st.text_input("Reviewer #2 (bucket 2)", value=st.session_state.get("r2", "")).strip()
+        n2 = st.number_input("Count #2", min_value=0, max_value=scope_total, value=int(st.session_state.get("n2", 0) or 0), step=1)
     with c2:
         r3 = st.text_input("Reviewer #3 (bucket 3)", value=st.session_state.get("r3", "")).strip()
+        n3 = st.number_input("Count #3", min_value=0, max_value=scope_total, value=int(st.session_state.get("n3", 0) or 0), step=1)
         r4 = st.text_input("Reviewer #4 (bucket 4)", value=st.session_state.get("r4", "")).strip()
+        n4 = st.number_input("Count #4", min_value=0, max_value=scope_total, value=int(st.session_state.get("n4", 0) or 0), step=1)
 
-    st.session_state["r1"], st.session_state["r2"], st.session_state["r3"], st.session_state["r4"] = r1, r2, r3, r4
+    st.session_state.update({"r1": r1, "r2": r2, "r3": r3, "r4": r4, "n1": int(n1), "n2": int(n2), "n3": int(n3), "n4": int(n4)})
 
-    if st.button("✅ Create / Overwrite assignments (sampled scope)"):
+    total_need = int(n1 + n2 + n3 + n4)
+    st.info(f"Requested total = {total_need} / scope total = {scope_total} (leftover = {scope_total - total_need})")
+
+    if st.button("✅ Create / Overwrite assignments (manual counts)"):
         try:
-            counts = create_assignments_evenly([r1, r2, r3, r4])
+            res = create_assignments_by_counts(
+                [(r1, int(n1)), (r2, int(n2)), (r3, int(n3)), (r4, int(n4))],
+                allow_partial=True
+            )
             st.cache_data.clear()
-            st.success("Assignments created.")
-            st.json(counts)
+            st.success("Assignments created/overwritten.")
+            st.json(res)
         except Exception as e:
             st.error(str(e))
 
@@ -540,23 +573,18 @@ if mode == "Review":
     if not reviewer_id:
         st.warning("Please input your reviewer_id in the sidebar.")
         st.stop()
-    if reviewer_id == GOLD_REVIEWER_ID:
-        st.info("Reviewer mode is for colleagues. Use Compare mode to inspect gold vs reviewer.")
-        st.stop()
 
-    # progress
+    # progress (works for gold too if you assign gold tasks)
     labeled, total = get_reviewer_progress(reviewer_id)
     st.sidebar.header("Your progress")
     st.sidebar.progress((labeled / total) if total else 0.0)
     st.sidebar.caption(f"{labeled} / {total} labeled (decision != uncertain)")
 
-    # cases list for this reviewer
     cases = get_sampled_cases_for_reviewer(reviewer_id)
     if not cases:
-        st.info("No cases assigned to you yet. Ask admin to create assignments.")
+        st.info("No cases assigned to this reviewer_id yet. Create assignments in Admin mode.")
         st.stop()
 
-    # pagination over assigned cases
     if "case_idx" not in st.session_state:
         st.session_state.case_idx = 0
 
@@ -597,7 +625,6 @@ if mode == "Review":
         f"CCTR_Bin: {row.get('cctr_bin')}"
     )
 
-    # test source + deps
     test_path, test_path_note = resolve_test_path(project_name, row)
     test_src = row.get("test_source") or (get_source_content(project_name, test_path) if test_path else "")
 
@@ -618,7 +645,6 @@ if mode == "Review":
     else:
         st.caption("No dependencies found for this test.")
 
-    # instantiations for this case, filtered to assigned
     st.subheader("🧩 Your Assigned Instantiations in This Case")
     insts_all = get_instantiations_for_case(project_name, suite_basename, method_name)
     insts = filter_insts_to_assigned(insts_all, reviewer_id)
@@ -630,7 +656,6 @@ if mode == "Review":
     inst_ids = [x["inst_id"] for x in insts]
     ann_map = load_annotations_cv(inst_ids, reviewer_id)
 
-    # rules
     rules = load_rules()
     rule_options: List[Tuple[str, int]] = []
     label_to_id: Dict[str, int] = {}
@@ -721,11 +746,12 @@ if mode == "Review":
                 }
             )
 
-    # Case actions
     st.subheader("✅ Case Actions")
 
-    # case progress for this reviewer
-    labeled_case = sum(1 for inst_id in inst_ids if (ann_map.get(inst_id) and ann_map[inst_id].get("decision") != "uncertain"))
+    labeled_case = sum(
+        1 for iid in inst_ids
+        if (ann_map.get(iid) and ann_map[iid].get("decision") != "uncertain")
+    )
     st.progress(labeled_case / len(inst_ids) if inst_ids else 0.0)
     st.caption(f"This case (your assigned insts): labeled {labeled_case} / {len(inst_ids)}")
 
@@ -782,7 +808,6 @@ if mode == "Review":
 if mode == "Compare":
     st.subheader("📊 Compare (gold vs reviewer)")
 
-    # reviewer list based on assignments (excluding gold)
     revs = db_fetchall("select distinct reviewer_id from assignments order by reviewer_id")
     revs = [r["reviewer_id"] for r in revs if r["reviewer_id"] != GOLD_REVIEWER_ID]
 
@@ -796,19 +821,18 @@ if mode == "Compare":
         st.warning("No comparable rows found. Check that assignments exist and gold labels are imported.")
         st.stop()
 
-    # Metrics
     total = len(df)
-    have_reviewer = df["reviewer_decision"].notna().sum()
-    have_gold = df["gold_decision"].notna().sum()
-    agree = df["agree"].sum()
+    have_reviewer = int(df["reviewer_decision"].notna().sum())
+    have_gold = int(df["gold_decision"].notna().sum())
+    agree = int(df["agree"].sum())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total assigned insts", total)
-    c2.metric("Reviewer labeled", int(have_reviewer))
-    c3.metric("Gold available", int(have_gold))
-    c4.metric("Agreements", int(agree))
+    c2.metric("Reviewer labeled", have_reviewer)
+    c3.metric("Gold available", have_gold)
+    c4.metric("Agreements", agree)
 
-    denom = max(int(have_reviewer), 1)
+    denom = max(have_reviewer, 1)
     st.caption(f"Agreement rate (among reviewer-labeled rows): {agree/denom:.3f}")
 
     st.subheader("Confusion matrix (gold vs reviewer)")
@@ -816,7 +840,11 @@ if mode == "Compare":
     st.dataframe(cm, use_container_width=True)
 
     st.subheader("Disagreements")
-    only_disagree = df[(df["reviewer_decision"].notna()) & (df["gold_decision"].notna()) & (df["agree"] == False)].copy()
+    only_disagree = df[
+        (df["reviewer_decision"].notna()) &
+        (df["gold_decision"].notna()) &
+        (df["agree"] == False)
+    ].copy()
     st.caption(f"Disagreements (both labeled): {len(only_disagree)}")
     st.dataframe(only_disagree.head(500), use_container_width=True)
 
