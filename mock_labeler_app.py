@@ -533,7 +533,7 @@ with st.sidebar:
 
     st.header("Identity")
     reviewer_id = st.text_input(
-        "reviewer_id (email or 'gold')",
+        "reviewer_id",
         value=st.session_state.get("reviewer_id", "")
     ).strip()
     st.session_state["reviewer_id"] = reviewer_id
