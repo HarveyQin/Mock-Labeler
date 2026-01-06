@@ -356,6 +356,23 @@ def highlight_method_in_source_html(full_src: str, method_src: str) -> str:
 
 
 # ===================== Sampled scope (instantiations under sampled_tests) =====================
+@st.cache_data(show_spinner=False)
+def get_sampled_scope_cases() -> List[Dict[str, Any]]:
+    """
+    Return sampled_tests in a deterministic order with derived suite_basename.
+    """
+    return db_fetchall(
+        """
+        select
+          st.id,
+          st.project,
+          regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+          st.method as test_case
+        from sampled_tests st
+        order by st.id
+        """
+    )
+
 
 @st.cache_data(show_spinner=False)
 def get_sampled_scope_inst_ids() -> List[str]:
@@ -615,50 +632,43 @@ def resolve_test_path(project: str, sampled_test_row: Dict[str, Any]) -> Tuple[O
 
 # ===================== Assignments =====================
 
-def create_assignments_by_counts(
+def create_case_assignments_by_counts(
     reviewers_and_counts: List[Tuple[str, int]],
-    allow_partial: bool = True
 ) -> Dict[str, Any]:
     """
-    Manually assign N instantiations to each reviewer in order (stable slicing).
-    reviewers_and_counts: [(reviewer_id, n), ...]
-    - If sum(n) < total and allow_partial=True: leftover will remain unassigned.
-    - If sum(n) > total: error.
-    Overwrites existing assignments for these reviewers within sampled scope inst_ids.
+    Assign sampled_tests (test cases), not instantiations.
+    Deterministic slicing by sampled_tests.id order.
     """
     reviewers_and_counts = [(r.strip(), int(n)) for r, n in reviewers_and_counts if r and r.strip()]
     if len(reviewers_and_counts) != 4:
         raise ValueError("Please provide exactly 4 reviewers (each with a count).")
-
     if any(n < 0 for _, n in reviewers_and_counts):
         raise ValueError("Counts must be >= 0.")
 
-    inst_ids = get_sampled_scope_inst_ids()
-    total_scope = len(inst_ids)
+    cases = get_sampled_scope_cases()
+    total_scope = len(cases)
     total_need = sum(n for _, n in reviewers_and_counts)
-
     if total_need > total_scope:
-        raise ValueError(f"Requested {total_need} but sampled scope has only {total_scope} instantiations.")
+        raise ValueError(f"Requested {total_need} but sampled scope has only {total_scope} test cases.")
 
-    # delete existing assignments for these reviewers within sampled scope
     reviewer_ids = [r for r, _ in reviewers_and_counts]
+
+    # delete existing assignments for these reviewers within full sampled scope (case-level)
     db_execute(
         """
-        delete from assignments
+        delete from case_assignments
         where reviewer_id = any(%s)
-          and inst_id = any(%s::uuid[])
         """,
-        (reviewer_ids, inst_ids),
+        (reviewer_ids,),
     )
 
-    # slice deterministically
     rows = []
     cur = 0
     for idx, (reviewer, n) in enumerate(reviewers_and_counts):
         bucket = idx + 1
-        take = inst_ids[cur: cur + n]
-        for inst_id in take:
-            rows.append((inst_id, reviewer, bucket))
+        slice_cases = cases[cur:cur+n]
+        for c in slice_cases:
+            rows.append((c["project"], c["suite_basename"], c["test_case"], reviewer, bucket))
         cur += n
 
     if rows:
@@ -667,24 +677,53 @@ def create_assignments_by_counts(
             execute_values(
                 cur2,
                 """
-                insert into assignments(inst_id, reviewer_id, bucket)
+                insert into case_assignments(project, test_suite_basename, test_case, reviewer_id, bucket)
                 values %s
-                on conflict (inst_id, reviewer_id) do update
-                  set bucket = excluded.bucket,
-                      assigned_at = now()
+                on conflict (project, test_suite_basename, test_case, reviewer_id)
+                do update set bucket = excluded.bucket, assigned_at = now()
                 """,
                 rows,
                 page_size=1000,
             )
 
-    counts = {r: n for r, n in reviewers_and_counts}
     leftover = total_scope - total_need
     return {
-        "scope_total": total_scope,
-        "assigned_total": total_need,
-        "leftover_unassigned": leftover,
-        "per_reviewer_requested": counts,
+        "scope_total_cases": total_scope,
+        "assigned_total_cases": total_need,
+        "leftover_unassigned_cases": leftover,
+        "per_reviewer_requested": {r: n for r, n in reviewers_and_counts},
     }
+
+@st.cache_data(show_spinner=False)
+def get_assigned_cases_for_reviewer(reviewer_id: str) -> List[Dict[str, Any]]:
+    return db_fetchall(
+        """
+        with st as (
+          select
+            st.id,
+            st.project,
+            st.file,
+            st.method,
+            regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+            st.testaware,
+            st.mockintensity,
+            st.dependencycount,
+            st.cctr_bin,
+            st.test_file_path,
+            st.test_source
+          from sampled_tests st
+        )
+        select st.*
+        from st
+        join case_assignments ca
+          on ca.project = st.project
+         and ca.test_suite_basename = st.suite_basename
+         and ca.test_case = st.method
+        where ca.reviewer_id = %s
+        order by st.id
+        """,
+        (reviewer_id,),
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -692,11 +731,55 @@ def get_assignment_counts() -> List[Dict[str, Any]]:
     return db_fetchall(
         """
         select reviewer_id, bucket, count(*) as n
-        from assignments
+        from case_assignments
         group by reviewer_id, bucket
         order by bucket, reviewer_id
         """
     )
+
+def get_reviewer_case_progress(reviewer_id: str) -> Tuple[int, int]:
+    """
+    A case is considered 'done' if all instantiations in that case have a non-uncertain decision.
+    """
+    total_row = db_fetchone(
+        "select count(*) as n from case_assignments where reviewer_id=%s",
+        (reviewer_id,)
+    )
+    total = int((total_row or {}).get("n") or 0)
+
+    done_row = db_fetchone(
+        """
+        with assigned as (
+          select ca.project, ca.test_suite_basename, ca.test_case
+          from case_assignments ca
+          where ca.reviewer_id = %s
+        ),
+        insts as (
+          select oi.inst_id, oi.project, oi.test_suite_basename, oi.test_case
+          from object_instantiations oi
+          join assigned a
+            on a.project = oi.project
+           and a.test_suite_basename = oi.test_suite_basename
+           and a.test_case = oi.test_case
+        ),
+        per_case as (
+          select
+            i.project, i.test_suite_basename, i.test_case,
+            sum(case when ac.decision is not null and ac.decision <> 'uncertain' then 1 else 0 end) as labeled,
+            count(*) as total_insts
+          from insts i
+          left join annotations_cv ac
+            on ac.inst_id = i.inst_id and ac.reviewer_id = %s
+          group by i.project, i.test_suite_basename, i.test_case
+        )
+        select count(*) as n
+        from per_case
+        where labeled = total_insts and total_insts > 0
+        """,
+        (reviewer_id, reviewer_id),
+    )
+    done = int((done_row or {}).get("n") or 0)
+    return done, total
 
 
 def get_reviewer_progress(reviewer_id: str) -> Tuple[int, int]:
@@ -720,16 +803,25 @@ def get_reviewer_progress(reviewer_id: str) -> Tuple[int, int]:
 # ===================== Compare =====================
 
 def compare_gold_vs_reviewer(reviewer_id: str) -> pd.DataFrame:
+    """
+    Compare ONLY the cases assigned to reviewer (case_assignments).
+    For those cases, compare reviewer annotations vs gold annotations on all instantiations.
+
+    Output columns:
+      inst_id, project, suite_basename, test_case, class_name, occurrence,
+      gold_decision, reviewer_decision, agree
+    """
     rows = db_fetchall(
         """
-        with stf as (
+        with assigned_cases as (
           select
-            st.project,
-            regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
-            st.method
-          from sampled_tests st
+            ca.project,
+            ca.test_suite_basename,
+            ca.test_case
+          from case_assignments ca
+          where ca.reviewer_id = %s
         ),
-        scope as (
+        insts as (
           select
             oi.inst_id,
             oi.project,
@@ -738,16 +830,10 @@ def compare_gold_vs_reviewer(reviewer_id: str) -> pd.DataFrame:
             oi.class_name,
             oi.occurrence_in_case
           from object_instantiations oi
-          join stf
-            on stf.project = oi.project
-           and stf.suite_basename = oi.test_suite_basename
-           and stf.method = oi.test_case
-        ),
-        assigned as (
-          select s.*
-          from scope s
-          join assignments a on a.inst_id = s.inst_id
-          where a.reviewer_id = %s
+          join assigned_cases ac
+            on ac.project = oi.project
+           and ac.test_suite_basename = oi.test_suite_basename
+           and ac.test_case = oi.test_case
         ),
         gold as (
           select inst_id, decision as gold_decision
@@ -760,26 +846,28 @@ def compare_gold_vs_reviewer(reviewer_id: str) -> pd.DataFrame:
           where reviewer_id = %s
         )
         select
-          a.inst_id::text as inst_id,
-          a.project,
-          a.test_suite_basename as suite_basename,
-          a.test_case,
-          a.class_name,
-          a.occurrence_in_case as occurrence,
+          i.inst_id::text as inst_id,
+          i.project,
+          i.test_suite_basename as suite_basename,
+          i.test_case,
+          i.class_name,
+          i.occurrence_in_case as occurrence,
           g.gold_decision,
           r.reviewer_decision
-        from assigned a
-        left join gold g on g.inst_id = a.inst_id
-        left join rev  r on r.inst_id = a.inst_id
-        order by a.project, a.test_suite_basename, a.test_case, a.class_name, a.occurrence_in_case, a.inst_id
+        from insts i
+        left join gold g on g.inst_id = i.inst_id
+        left join rev  r on r.inst_id = i.inst_id
+        order by i.project, i.test_suite_basename, i.test_case, i.class_name, i.occurrence_in_case, i.inst_id
         """,
         (reviewer_id, GOLD_REVIEWER_ID, reviewer_id),
     )
+
     df = pd.DataFrame(rows)
     if df.empty:
         return df
     df["agree"] = (df["gold_decision"].fillna("") == df["reviewer_decision"].fillna(""))
     return df
+
 
 
 def confusion_matrix(df: pd.DataFrame) -> pd.DataFrame:
@@ -821,9 +909,9 @@ with st.sidebar:
 if mode == "Admin":
     st.subheader("🛠 Admin: Assignments (Manual counts)")
 
-    inst_ids = get_sampled_scope_inst_ids()
-    scope_total = len(inst_ids)
-    st.caption(f"Sampled scope instantiations: {scope_total}")
+    cases_scope = get_sampled_scope_cases()
+    scope_total = len(cases_scope)
+    st.caption(f"Sampled scope test cases: {scope_total}")
 
     st.write("Provide **exactly 4** reviewers and how many instantiations each should review. "
              "Assignments are created by deterministic slicing of the sampled-scope inst_id list.")
@@ -847,9 +935,8 @@ if mode == "Admin":
 
     if st.button("✅ Create / Overwrite assignments (manual counts)"):
         try:
-            res = create_assignments_by_counts(
-                [(r1, int(n1)), (r2, int(n2)), (r3, int(n3)), (r4, int(n4))],
-                allow_partial=True
+            res = create_case_assignments_by_counts(
+                [(r1, int(n1)), (r2, int(n2)), (r3, int(n3)), (r4, int(n4))]
             )
             st.cache_data.clear()
             st.success("Assignments created/overwritten.")
@@ -877,62 +964,59 @@ if mode == "Review":
     st.sidebar.header("Your progress")
 
     if reviewer_id == GOLD_REVIEWER_ID:
-        # total = all instantiations under sampled scope
-        total_row = db_fetchone(
-            """
-            with stf as (
-              select
-                st.project,
-                regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
-                st.method
-              from sampled_tests st
-            )
-            select count(*) as n
-            from object_instantiations oi
-            join stf
-              on stf.project = oi.project
-             and stf.suite_basename = oi.test_suite_basename
-             and stf.method = oi.test_case
-            """
-        )
+        # gold: full sampled scope case progress
+        total_row = db_fetchone("select count(*) as n from sampled_tests")
         total = int((total_row or {}).get("n") or 0)
 
-        labeled_row = db_fetchone(
+        done_row = db_fetchone(
             """
             with stf as (
               select
                 st.project,
                 regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
-                st.method
+                st.method as test_case
               from sampled_tests st
             ),
-            scope as (
-              select oi.inst_id
+            insts as (
+              select oi.inst_id, oi.project, oi.test_suite_basename, oi.test_case
               from object_instantiations oi
               join stf
                 on stf.project = oi.project
                and stf.suite_basename = oi.test_suite_basename
-               and stf.method = oi.test_case
+               and stf.test_case = oi.test_case
+            ),
+            per_case as (
+              select
+                s.project, s.suite_basename, s.test_case,
+                count(i.inst_id) as total_insts,
+                sum(case when ac.decision is not null and ac.decision <> 'uncertain' then 1 else 0 end) as labeled
+              from stf s
+              left join insts i
+                on i.project = s.project
+               and i.test_suite_basename = s.suite_basename
+               and i.test_case = s.test_case
+              left join annotations_cv ac
+                on ac.inst_id = i.inst_id and ac.reviewer_id = %s
+              group by s.project, s.suite_basename, s.test_case
             )
             select count(*) as n
-            from annotations_cv ac
-            join scope s on s.inst_id = ac.inst_id
-            where ac.reviewer_id = %s and ac.decision <> 'uncertain'
+            from per_case
+            where total_insts > 0 and labeled = total_insts
             """,
             (GOLD_REVIEWER_ID,),
         )
-        labeled = int((labeled_row or {}).get("n") or 0)
+        done = int((done_row or {}).get("n") or 0)
     else:
-        labeled, total = get_reviewer_progress(reviewer_id)
+        done, total = get_reviewer_case_progress(reviewer_id)
 
-    st.sidebar.progress((labeled / total) if total else 0.0)
-    st.sidebar.caption(f"{labeled} / {total} labeled (decision != uncertain)")
+    st.sidebar.progress((done / total) if total else 0.0)
+    st.sidebar.caption(f"{done} / {total} cases done")
 
     # gold: can browse full sampled scope without assignments
     if reviewer_id == GOLD_REVIEWER_ID:
         cases = get_sampled_cases_all()
     else:
-        cases = get_sampled_cases_for_reviewer(reviewer_id)
+        cases = get_assigned_cases_for_reviewer(reviewer_id)
 
     if not cases:
         st.info("No cases available for this reviewer_id. For non-gold reviewers, ask admin to create assignments.")
@@ -1038,13 +1122,9 @@ if mode == "Review":
 
 
     st.subheader("🧩 Your Assigned Instantiations in This Case")
-    insts_all = get_instantiations_for_case(project_name, suite_basename, method_name)
 
     # gold: see all instantiations in sampled scope case
-    if reviewer_id == GOLD_REVIEWER_ID:
-        insts = insts_all
-    else:
-        insts = filter_insts_to_assigned(insts_all, reviewer_id)
+    insts = get_instantiations_for_case(project_name, suite_basename, method_name)
 
     if not insts:
         st.info("No instantiations available in this case for you. Click Next Case.")
@@ -1205,12 +1285,12 @@ if mode == "Review":
 if mode == "Compare":
     st.subheader("📊 Compare (gold vs reviewer)")
 
-    revs = db_fetchall("select distinct reviewer_id from assignments order by reviewer_id")
+    revs = db_fetchall("select distinct reviewer_id from case_assignments order by reviewer_id")
     revs = [r["reviewer_id"] for r in revs if r["reviewer_id"] != GOLD_REVIEWER_ID]
 
     sel = st.selectbox("Select reviewer", options=revs, index=0 if revs else None)
     if not sel:
-        st.info("No reviewers found in assignments yet. Create assignments in Admin mode.")
+        st.info("No reviewers found in case_assignments yet. Create assignments in Admin mode.")
         st.stop()
 
     df = compare_gold_vs_reviewer(sel)
