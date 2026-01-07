@@ -138,6 +138,20 @@ def db_execute(sql: str, params: tuple = ()) -> None:
 
 
 # ===================== Helpers =====================
+@st.cache_data(show_spinner=False)
+def get_assigned_case_keys() -> set[tuple[str, str, str]]:
+    """
+    Return all assigned case keys in case_assignments:
+    (project, suite_basename, test_case)
+    """
+    rows = db_fetchall(
+        """
+        select project, test_suite_basename, test_case
+        from case_assignments
+        """
+    )
+    return {(r["project"], r["test_suite_basename"], r["test_case"]) for r in rows}
+
 
 def basename_of_path(s: str) -> str:
     if s is None:
@@ -708,10 +722,12 @@ def resolve_test_path(project: str, sampled_test_row: Dict[str, Any]) -> Tuple[O
 
 def create_case_assignments_by_counts(
     reviewers_and_counts: List[Tuple[str, int]],
+    overwrite: bool = False,
 ) -> Dict[str, Any]:
     """
     Assign sampled_tests (test cases), not instantiations.
-    Deterministic slicing by sampled_tests.id order.
+    - overwrite=False (default): append new assignments from *unassigned* cases only.
+    - overwrite=True: delete existing assignments for these reviewers and reassign from scratch.
     """
     reviewers_and_counts = [(r.strip(), int(n)) for r, n in reviewers_and_counts if r and r.strip()]
     if len(reviewers_and_counts) != 4:
@@ -719,34 +735,43 @@ def create_case_assignments_by_counts(
     if any(n < 0 for _, n in reviewers_and_counts):
         raise ValueError("Counts must be >= 0.")
 
-    cases = get_sampled_scope_cases()
-    total_scope = len(cases)
-    total_need = sum(n for _, n in reviewers_and_counts)
-    if total_need > total_scope:
-        raise ValueError(f"Requested {total_need} but sampled scope has only {total_scope} test cases.")
+    all_cases = get_sampled_scope_cases()  # ordered by sampled_tests.id
+    total_scope = len(all_cases)
 
     reviewer_ids = [r for r, _ in reviewers_and_counts]
 
-    # delete existing assignments for these reviewers within full sampled scope (case-level)
-    db_execute(
-        """
-        delete from case_assignments
-        where reviewer_id = any(%s)
-        """,
-        (reviewer_ids,),
-    )
+    if overwrite:
+        # delete existing assignments for these reviewers only
+        db_execute(
+            "delete from case_assignments where reviewer_id = any(%s)",
+            (reviewer_ids,),
+        )
+
+    # For append mode: only take cases that are not assigned to ANYONE yet
+    assigned_keys = get_assigned_case_keys()
+    available_cases = [
+        c for c in all_cases
+        if (c["project"], c["suite_basename"], c["test_case"]) not in assigned_keys
+    ]
+
+    total_need = sum(n for _, n in reviewers_and_counts)
+    if total_need > len(available_cases):
+        raise ValueError(
+            f"Requested {total_need} new cases but only {len(available_cases)} unassigned cases remain "
+            f"(scope total={total_scope})."
+        )
 
     rows = []
     cur = 0
     for idx, (reviewer, n) in enumerate(reviewers_and_counts):
         bucket = idx + 1
-        slice_cases = cases[cur:cur+n]
+        slice_cases = available_cases[cur:cur + n]
         for c in slice_cases:
             rows.append((c["project"], c["suite_basename"], c["test_case"], reviewer, bucket))
         cur += n
 
     if rows:
-        conn = get_conn_safe()
+        conn = get_conn_safe()  # 用你之前修复连接那套更稳
         with conn.cursor() as cur2:
             execute_values(
                 cur2,
@@ -760,13 +785,17 @@ def create_case_assignments_by_counts(
                 page_size=1000,
             )
 
-    leftover = total_scope - total_need
+    # report
+    remaining = len(available_cases) - total_need
     return {
         "scope_total_cases": total_scope,
-        "assigned_total_cases": total_need,
-        "leftover_unassigned_cases": leftover,
+        "available_unassigned_before": len(available_cases),
+        "newly_assigned_cases": total_need,
+        "remaining_unassigned_after": remaining,
+        "overwrite": overwrite,
         "per_reviewer_requested": {r: n for r, n in reviewers_and_counts},
     }
+
 
 @st.cache_data(show_spinner=False)
 def get_assigned_cases_for_reviewer(reviewer_id: str) -> List[Dict[str, Any]]:
@@ -1006,11 +1035,14 @@ if mode == "Admin":
 
     total_need = int(n1 + n2 + n3 + n4)
     st.info(f"Requested total = {total_need} / scope total = {scope_total} (leftover = {scope_total - total_need})")
+    overwrite = st.checkbox("Overwrite existing assignments for these reviewers", value=False)
+
 
     if st.button("✅ Create / Overwrite assignments (manual counts)"):
         try:
             res = create_case_assignments_by_counts(
-                [(r1, int(n1)), (r2, int(n2)), (r3, int(n3)), (r4, int(n4))]
+                [(r1, int(n1)), (r2, int(n2)), (r3, int(n3)), (r4, int(n4))],
+                overwrite=overwrite,
             )
             st.cache_data.clear()
             st.success("Assignments created/overwritten.")
