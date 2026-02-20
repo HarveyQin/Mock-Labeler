@@ -2,16 +2,26 @@
 """
 mock_labeler_app.py
 
-Cross-validation-ready Streamlit app:
-- Scope of review: ONLY object_instantiations that belong to sampled_tests
-  (matched by project + suite_basename(file) + method(test_case))
-- Multi-reviewer annotations: annotations_cv(inst_id, reviewer_id)
-- Assignments: assignments(inst_id, reviewer_id, bucket)
+Streamlit app for cross-validation labeling (Postgres/Neon):
 
-Modes:
-- Review: reviewers label ONLY their assigned instantiations (including gold if reviewer_id='gold')
-- Compare: compare reviewer vs gold and export disagreements
-- Admin: create/reset assignments and view counts
+Data/Process (new):
+- sampled_tests contains 800 cases with split in {learning, eval_seen, eval_unseen}
+- Learning split (400): reviewed by 2 people (config LEARNING_REVIEWERS). They can add/modify rules.
+- Evaluation splits (400 total): reviewed by 4 people (case_assignments), each case labeled once.
+  Rules are frozen during evaluation (UI disables adding new rules).
+
+Scope of review:
+- ONLY object_instantiations that belong to sampled_tests
+  (matched by project + suite_basename(file) + method(test_case))
+
+Tables used:
+- sampled_tests(id, project, file, method, ..., suite_basename, split, batch_id, test_file_path, test_source)
+- object_instantiations(inst_id uuid, project, test_suite, test_suite_basename, test_case, class_name, occurrence_in_case, mocked, source_row_index, created_at)
+- rules(id, type, high_level_category, criterion, mock_decision, ...)
+- annotations_cv(inst_id uuid, reviewer_id text, decision text, notes text, rule_ids jsonb, rule_labels jsonb, updated_at, updated_by, ...)
+- case_assignments(project, test_suite_basename, test_case, reviewer_id, bucket, assigned_at, ...)
+- test_dependencies(project, test_path, dep_path)
+- source_files(project, path, content)
 
 Secrets:
 - st.secrets["DB_URL"] = "postgresql://.../neondb?sslmode=require"
@@ -19,16 +29,26 @@ Secrets:
 
 import json
 from typing import Dict, List, Any, Optional, Tuple
-import re
 import html
+
 import streamlit as st
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
-from psycopg2 import OperationalError, InterfaceError, DatabaseError
+
+
+# ===================== CONFIG =====================
 
 VALID_DECISIONS = ["mock", "no-mock", "uncertain", "skip"]
 GOLD_REVIEWER_ID = "gold"
+
+LEARNING_SPLITS = {"learning"}
+EVAL_SPLITS = {"eval_seen", "eval_unseen"}
+
+LEARNING_REVIEWERS = {"Hanbin", "Tong"}  # <-- change learner2
+EVAL_REVIEWERS = {"r1", "r2", "r3", "r4"}  # <-- change to your 4 eval reviewers
+
+RULES_FROZEN_FOR_EVAL = True
 
 
 # ===================== DB =====================
@@ -43,115 +63,28 @@ def get_conn():
     return conn
 
 
-
-def _conn_is_usable(conn) -> bool:
-    try:
-        if conn is None:
-            return False
-        if getattr(conn, "closed", 1) != 0:
-            return False
-        # lightweight ping
-        with conn.cursor() as cur:
-            cur.execute("select 1")
-            _ = cur.fetchone()
-        return True
-    except Exception:
-        return False
-
-
-def get_conn_safe():
-    """
-    Return a usable connection; if cached conn is stale, clear cache and reconnect.
-    """
-    conn = get_conn()
-    if _conn_is_usable(conn):
-        return conn
-
-    # cached conn is stale -> clear cached resource and rebuild
-    try:
-        st.cache_resource.clear()
-    except Exception:
-        pass
-
-    conn = get_conn()
-    return conn
-
 def db_fetchall(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    for attempt in (1, 2):
-        try:
-            conn = get_conn_safe()
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(sql, params)
-                return list(cur.fetchall())
-        except (OperationalError, InterfaceError) as e:
-            # stale connection
-            if attempt == 1:
-                try:
-                    st.cache_resource.clear()
-                except Exception:
-                    pass
-                continue
-            raise
-        except DatabaseError:
-            # real SQL error; don't retry silently
-            raise
-
+    conn = get_conn()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, params)
+        return list(cur.fetchall())
 
 
 def db_fetchone(sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
-    for attempt in (1, 2):
-        try:
-            conn = get_conn_safe()
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(sql, params)
-                row = cur.fetchone()
-                return dict(row) if row else None
-        except (OperationalError, InterfaceError):
-            if attempt == 1:
-                try:
-                    st.cache_resource.clear()
-                except Exception:
-                    pass
-                continue
-            raise
-        except DatabaseError:
-            raise
+    conn = get_conn()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return dict(row) if row else None
 
 
 def db_execute(sql: str, params: tuple = ()) -> None:
-    for attempt in (1, 2):
-        try:
-            conn = get_conn_safe()
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-            return
-        except (OperationalError, InterfaceError):
-            if attempt == 1:
-                try:
-                    st.cache_resource.clear()
-                except Exception:
-                    pass
-                continue
-            raise
-        except DatabaseError:
-            raise
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
 
 
 # ===================== Helpers =====================
-@st.cache_data(show_spinner=False)
-def get_assigned_case_keys() -> set[tuple[str, str, str]]:
-    """
-    Return all assigned case keys in case_assignments:
-    (project, suite_basename, test_case)
-    """
-    rows = db_fetchall(
-        """
-        select project, test_suite_basename, test_case
-        from case_assignments
-        """
-    )
-    return {(r["project"], r["test_suite_basename"], r["test_case"]) for r in rows}
-
 
 def basename_of_path(s: str) -> str:
     if s is None:
@@ -165,6 +98,7 @@ def safe_int(x: Any, default: int = 0) -> int:
         return int(x)
     except Exception:
         return default
+
 
 def java_class_name_from_path(p: str) -> str:
     """
@@ -182,7 +116,7 @@ def java_class_name_from_path(p: str) -> str:
     return base
 
 
-def extract_java_method(src: str, method_name: str, max_chars: int = 200000) -> str:
+def extract_java_method(src: str, method_name: str, max_chars: int = 250000) -> str:
     """
     Robust extraction of a Java method declaration by name.
 
@@ -212,11 +146,9 @@ def extract_java_method(src: str, method_name: str, max_chars: int = 200000) -> 
             if s[i].isspace():
                 i += 1
                 continue
-            # line comment
             if s.startswith("//", i):
                 j = s.find("\n", i + 2)
                 return n if j == -1 else j + 1
-            # block comment
             if s.startswith("/*", i):
                 j = s.find("*/", i + 2)
                 if j == -1:
@@ -227,7 +159,6 @@ def extract_java_method(src: str, method_name: str, max_chars: int = 200000) -> 
         return i
 
     def find_matching_paren(open_paren_idx: int) -> int:
-        """Given index of '(', find matching ')' considering strings/chars."""
         i = open_paren_idx
         n = len(s)
         depth = 0
@@ -264,16 +195,12 @@ def extract_java_method(src: str, method_name: str, max_chars: int = 200000) -> 
         return -1
 
     def find_open_brace(after_idx: int) -> int:
-        """
-        Find the '{' that starts the method body after the parameter list.
-        Allows: whitespace/comments + optional 'throws ...' (possibly multi-token) before '{'
-        """
         i = skip_ws_and_comments(after_idx)
-
         # optional "throws ..."
-        if s.startswith("throws", i) and (i == 0 or not is_ident_char(s[i - 1])) and (i + 6 >= len(s) or not is_ident_char(s[i + 6])):
+        if s.startswith("throws", i) and (i == 0 or not is_ident_char(s[i - 1])) and (
+            i + 6 >= len(s) or not is_ident_char(s[i + 6])
+        ):
             i += 6
-            # scan until we hit '{' or ';' (abstract/interface method) or end
             n = len(s)
             in_str = False
             in_chr = False
@@ -310,7 +237,6 @@ def extract_java_method(src: str, method_name: str, max_chars: int = 200000) -> 
         return i if i < len(s) and s[i] == "{" else -1
 
     def find_matching_brace(open_brace_idx: int) -> int:
-        """Given index of '{', find matching '}' considering strings/chars."""
         i = open_brace_idx
         n = len(s)
         depth = 0
@@ -346,7 +272,6 @@ def extract_java_method(src: str, method_name: str, max_chars: int = 200000) -> 
             i += 1
         return -1
 
-    # iterate all occurrences
     start_search = 0
     while True:
         idx = s.find(needle, start_search)
@@ -356,25 +281,20 @@ def extract_java_method(src: str, method_name: str, max_chars: int = 200000) -> 
         name_start = idx
         name_end = idx + len(method_name)
 
-        # Filter out invocations like obj.methodName( or Class.methodName(
         prev = s[name_start - 1] if name_start - 1 >= 0 else ""
         if prev == ".":
             start_search = idx + 1
             continue
-
-        # Ensure method name is not part of a larger identifier
         if prev and is_ident_char(prev):
             start_search = idx + 1
             continue
 
-        # Parse params
         open_paren = name_end
         close_paren = find_matching_paren(open_paren)
         if close_paren == -1:
             start_search = idx + 1
             continue
 
-        # Find body '{'
         open_brace = find_open_brace(close_paren + 1)
         if open_brace == -1:
             start_search = idx + 1
@@ -385,19 +305,16 @@ def extract_java_method(src: str, method_name: str, max_chars: int = 200000) -> 
             start_search = idx + 1
             continue
 
-        # choose a reasonable start: beginning of the line that contains the declaration
         line_start = s.rfind("\n", 0, name_start)
         if line_start == -1:
             line_start = 0
         else:
             line_start += 1
 
-        return s[line_start:close_brace + 1].strip()
-
-        # next
-        start_search = idx + 1
+        return s[line_start: close_brace + 1].strip()
 
     return ""
+
 
 def add_markers_around_method(full_src: str, method_src: str, method_name: str) -> str:
     """
@@ -410,7 +327,7 @@ def add_markers_around_method(full_src: str, method_src: str, method_name: str) 
         return full_src
 
     start_marker = f"// >>>>>>> CURRENT REVIEW TEST CASE: {method_name} >>>>>>>"
-    end_marker   = f"// <<<<<<< END CURRENT REVIEW TEST CASE: {method_name} <<<<<<<"
+    end_marker = f"// <<<<<<< END CURRENT REVIEW TEST CASE: {method_name} <<<<<<<"
 
     idx = full_src.find(method_src)
     if idx < 0:
@@ -418,91 +335,82 @@ def add_markers_around_method(full_src: str, method_src: str, method_name: str) 
 
     before = full_src[:idx].rstrip("\n")
     after = full_src[idx + len(method_src):].lstrip("\n")
-
     return f"{before}\n{start_marker}\n{method_src}\n{end_marker}\n{after}"
 
 
 def highlight_method_in_source_html(full_src: str, method_src: str) -> str:
     """
     Render full source as HTML <pre><code> with method_src highlighted.
+    (Not used by default; kept if you want to switch to HTML rendering)
     """
     if not full_src:
         return "<pre><code></code></pre>"
 
     esc_full = html.escape(full_src)
-
     if method_src and method_src in full_src:
         esc_method = html.escape(method_src)
-        # highlight first occurrence
-        esc_full = esc_full.replace(
-            esc_method,
-            f'<span class="hl">{esc_method}</span>',
-            1
-        )
-
+        esc_full = esc_full.replace(esc_method, f"<span class='hl'>{esc_method}</span>", 1)
     return f"<pre class='code'><code>{esc_full}</code></pre>"
 
 
-# ===================== Sampled scope (instantiations under sampled_tests) =====================
+# ===================== Sampled scope / cases =====================
+
 @st.cache_data(show_spinner=False)
-def get_sampled_scope_cases() -> List[Dict[str, Any]]:
-    """
-    Return sampled_tests in a deterministic order with derived suite_basename.
-    """
+def get_eval_scope_cases() -> List[Dict[str, Any]]:
     return db_fetchall(
-        """
+        r"""
         select
           st.id,
           st.project,
-          regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
-          st.method as test_case
+          regexp_replace(replace(st.file, '\\', '/'), '^.*/', '') as suite_basename,
+          st.method as test_case,
+          st.split
         from sampled_tests st
+        where st.split in ('eval_seen','eval_unseen')
         order by st.id
         """
     )
 
 
 @st.cache_data(show_spinner=False)
-def get_sampled_scope_inst_ids() -> List[str]:
+def get_cases_for_reviewer_by_process(reviewer_id: str) -> List[Dict[str, Any]]:
     """
-    Return all inst_id (uuid as text) that belong to sampled_tests scope.
-    Deterministic ordering for assignment slicing.
+    New process:
+    - Learning split: only LEARNING_REVIEWERS can review; no assignments needed
+    - Eval splits: only assigned cases via case_assignments
     """
-    rows = db_fetchall(
-        """
-        with stf as (
-          select
-            st.project,
-            regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
-            st.method
-          from sampled_tests st
+    if reviewer_id in LEARNING_REVIEWERS:
+        return db_fetchall(
+            r"""
+            select
+              st.id,
+              st.project,
+              st.file,
+              st.method,
+              regexp_replace(replace(st.file, '\\', '/'), '^.*/', '') as suite_basename,
+              st.split,
+              st.testaware,
+              st.mockintensity,
+              st.dependencycount,
+              st.cctr_bin,
+              st.test_file_path,
+              st.test_source
+            from sampled_tests st
+            where st.split = 'learning'
+            order by st.id
+            """
         )
-        select oi.inst_id::text as inst_id
-        from object_instantiations oi
-        join stf
-          on stf.project = oi.project
-         and stf.suite_basename = oi.test_suite_basename
-         and stf.method = oi.test_case
-        order by oi.project, oi.test_suite_basename, oi.test_case, oi.class_name, oi.occurrence_in_case, oi.inst_id
-        """
-    )
-    return [r["inst_id"] for r in rows]
 
-
-@st.cache_data(show_spinner=False)
-def get_sampled_cases_for_reviewer(reviewer_id: str) -> List[Dict[str, Any]]:
-    """
-    List sampled_tests cases that have at least one instantiation assigned to reviewer.
-    """
-    rows = db_fetchall(
-        """
+    return db_fetchall(
+        r"""
         with st as (
           select
             st.id,
             st.project,
             st.file,
             st.method,
-            regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+            regexp_replace(replace(st.file, '\\', '/'), '^.*/', '') as suite_basename,
+            st.split,
             st.testaware,
             st.mockintensity,
             st.dependencycount,
@@ -510,49 +418,20 @@ def get_sampled_cases_for_reviewer(reviewer_id: str) -> List[Dict[str, Any]]:
             st.test_file_path,
             st.test_source
           from sampled_tests st
-        ),
-        assigned as (
-          select distinct
-            oi.project, oi.test_suite_basename, oi.test_case
-          from assignments a
-          join object_instantiations oi on oi.inst_id = a.inst_id
-          where a.reviewer_id = %s
+          where st.split in ('eval_seen','eval_unseen')
         )
         select st.*
         from st
-        join assigned
-          on assigned.project = st.project
-         and assigned.test_suite_basename = st.suite_basename
-         and assigned.test_case = st.method
+        join case_assignments ca
+          on ca.project = st.project
+         and ca.test_suite_basename = st.suite_basename
+         and ca.test_case = st.method
+        where ca.reviewer_id = %s
         order by st.id
         """,
         (reviewer_id,),
     )
-    return rows
 
-@st.cache_data(show_spinner=False)
-def get_sampled_cases_all() -> List[Dict[str, Any]]:
-    """
-    All sampled_tests cases (full sampled scope).
-    """
-    return db_fetchall(
-        """
-        select
-          st.id,
-          st.project,
-          st.file,
-          st.method,
-          regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
-          st.testaware,
-          st.mockintensity,
-          st.dependencycount,
-          st.cctr_bin,
-          st.test_file_path,
-          st.test_source
-        from sampled_tests st
-        order by st.id
-        """
-    )
 
 def get_instantiations_for_case(project: str, suite_basename: str, method: str) -> List[Dict[str, Any]]:
     return db_fetchall(
@@ -573,22 +452,6 @@ def get_instantiations_for_case(project: str, suite_basename: str, method: str) 
         """,
         (project, suite_basename, method),
     )
-
-
-def filter_insts_to_assigned(insts: List[Dict[str, Any]], reviewer_id: str) -> List[Dict[str, Any]]:
-    if not insts:
-        return []
-    inst_ids = [x["inst_id"] for x in insts]
-    rows = db_fetchall(
-        """
-        select inst_id::text as inst_id
-        from assignments
-        where reviewer_id=%s and inst_id = any(%s::uuid[])
-        """,
-        (reviewer_id, inst_ids),
-    )
-    allowed = set(r["inst_id"] for r in rows)
-    return [x for x in insts if x["inst_id"] in allowed]
 
 
 def load_rules() -> List[Dict[str, Any]]:
@@ -632,7 +495,7 @@ def load_annotations_cv(inst_ids: List[str], reviewer_id: str) -> Dict[str, Dict
         """,
         (reviewer_id, inst_ids),
     )
-    out = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         out[r["inst_id"]] = r
     return out
@@ -674,17 +537,36 @@ def get_source_content(project: str, path: str) -> str:
     return (row or {}).get("content") or ""
 
 
-def get_dependencies(project: str, test_path: Optional[str]) -> List[str]:
-    if not test_path:
+def get_dependencies(project: str, test_path: Optional[str], suite_basename: Optional[str] = None) -> List[str]:
+    """
+    Prefer exact match on (project, test_path).
+    Fallback: match by basename (endswith '/<suite_basename>').
+    """
+    if test_path:
+        rows = db_fetchall(
+            """
+            select dep_path
+            from test_dependencies
+            where project=%s and test_path=%s
+            order by dep_path
+            """,
+            (project, test_path),
+        )
+        if rows:
+            return [r["dep_path"] for r in rows]
+
+    if not suite_basename:
         return []
+
+    base = basename_of_path(suite_basename).lower()
     rows = db_fetchall(
         """
         select dep_path
         from test_dependencies
-        where project=%s and test_path=%s
+        where project=%s and lower(test_path) like %s
         order by dep_path
         """,
-        (project, test_path),
+        (project, f"%/{base}"),
     )
     return [r["dep_path"] for r in rows]
 
@@ -718,16 +600,14 @@ def resolve_test_path(project: str, sampled_test_row: Dict[str, Any]) -> Tuple[O
     return None, "not found in test_dependencies"
 
 
-# ===================== Assignments =====================
+# ===================== Assignments (case-level, eval only) =====================
 
 def create_case_assignments_by_counts(
     reviewers_and_counts: List[Tuple[str, int]],
-    overwrite: bool = False,
 ) -> Dict[str, Any]:
     """
-    Assign sampled_tests (test cases), not instantiations.
-    - overwrite=False (default): append new assignments from *unassigned* cases only.
-    - overwrite=True: delete existing assignments for these reviewers and reassign from scratch.
+    Assign ONLY evaluation cases (eval_seen + eval_unseen), each case assigned ONCE.
+    Deterministic slicing by sampled_tests.id order.
     """
     reviewers_and_counts = [(r.strip(), int(n)) for r, n in reviewers_and_counts if r and r.strip()]
     if len(reviewers_and_counts) != 4:
@@ -735,43 +615,45 @@ def create_case_assignments_by_counts(
     if any(n < 0 for _, n in reviewers_and_counts):
         raise ValueError("Counts must be >= 0.")
 
-    all_cases = get_sampled_scope_cases()  # ordered by sampled_tests.id
-    total_scope = len(all_cases)
+    cases = get_eval_scope_cases()
+    total_scope = len(cases)
+    total_need = sum(n for _, n in reviewers_and_counts)
+
+    if total_need != total_scope:
+        raise ValueError(
+            f"Eval scope has {total_scope} cases, but requested total is {total_need}. "
+            f"Please make it exactly {total_scope}."
+        )
 
     reviewer_ids = [r for r, _ in reviewers_and_counts]
 
-    if overwrite:
-        # delete existing assignments for these reviewers only
-        db_execute(
-            "delete from case_assignments where reviewer_id = any(%s)",
-            (reviewer_ids,),
-        )
-
-    # For append mode: only take cases that are not assigned to ANYONE yet
-    assigned_keys = get_assigned_case_keys()
-    available_cases = [
-        c for c in all_cases
-        if (c["project"], c["suite_basename"], c["test_case"]) not in assigned_keys
-    ]
-
-    total_need = sum(n for _, n in reviewers_and_counts)
-    if total_need > len(available_cases):
-        raise ValueError(
-            f"Requested {total_need} new cases but only {len(available_cases)} unassigned cases remain "
-            f"(scope total={total_scope})."
-        )
+    # delete existing eval assignments for these reviewers
+    db_execute(
+        """
+        delete from case_assignments
+        where reviewer_id = any(%s)
+          and (project, test_suite_basename, test_case) in (
+            select st.project,
+                   regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
+                   st.method
+            from sampled_tests st
+            where st.split in ('eval_seen','eval_unseen')
+          );
+        """,
+        (reviewer_ids,),
+    )
 
     rows = []
     cur = 0
     for idx, (reviewer, n) in enumerate(reviewers_and_counts):
         bucket = idx + 1
-        slice_cases = available_cases[cur:cur + n]
+        slice_cases = cases[cur:cur + n]
         for c in slice_cases:
             rows.append((c["project"], c["suite_basename"], c["test_case"], reviewer, bucket))
         cur += n
 
     if rows:
-        conn = get_conn_safe()  # 用你之前修复连接那套更稳
+        conn = get_conn()
         with conn.cursor() as cur2:
             execute_values(
                 cur2,
@@ -785,52 +667,15 @@ def create_case_assignments_by_counts(
                 page_size=1000,
             )
 
-    # report
-    remaining = len(available_cases) - total_need
     return {
-        "scope_total_cases": total_scope,
-        "available_unassigned_before": len(available_cases),
-        "newly_assigned_cases": total_need,
-        "remaining_unassigned_after": remaining,
-        "overwrite": overwrite,
+        "eval_scope_total_cases": total_scope,
+        "assigned_total_cases": total_need,
         "per_reviewer_requested": {r: n for r, n in reviewers_and_counts},
     }
 
 
 @st.cache_data(show_spinner=False)
-def get_assigned_cases_for_reviewer(reviewer_id: str) -> List[Dict[str, Any]]:
-    return db_fetchall(
-        """
-        with st as (
-          select
-            st.id,
-            st.project,
-            st.file,
-            st.method,
-            regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
-            st.testaware,
-            st.mockintensity,
-            st.dependencycount,
-            st.cctr_bin,
-            st.test_file_path,
-            st.test_source
-          from sampled_tests st
-        )
-        select st.*
-        from st
-        join case_assignments ca
-          on ca.project = st.project
-         and ca.test_suite_basename = st.suite_basename
-         and ca.test_case = st.method
-        where ca.reviewer_id = %s
-        order by st.id
-        """,
-        (reviewer_id,),
-    )
-
-
-@st.cache_data(show_spinner=False)
-def get_assignment_counts() -> List[Dict[str, Any]]:
+def get_case_assignment_counts() -> List[Dict[str, Any]]:
     return db_fetchall(
         """
         select reviewer_id, bucket, count(*) as n
@@ -840,10 +685,52 @@ def get_assignment_counts() -> List[Dict[str, Any]]:
         """
     )
 
+
 def get_reviewer_case_progress(reviewer_id: str) -> Tuple[int, int]:
     """
     A case is considered 'done' if all instantiations in that case have a non-uncertain decision.
+    For learning reviewers: use learning split (no assignments).
+    For eval reviewers: use their assigned eval cases.
     """
+    if reviewer_id in LEARNING_REVIEWERS:
+        total_row = db_fetchone(
+            "select count(*) as n from sampled_tests where split='learning'"
+        )
+        total = int((total_row or {}).get("n") or 0)
+
+        done_row = db_fetchone(
+            """
+            with cases as (
+              select project, suite_basename, method as test_case
+              from sampled_tests
+              where split='learning'
+            ),
+            insts as (
+              select oi.inst_id, oi.project, oi.test_suite_basename, oi.test_case
+              from object_instantiations oi
+              join cases c
+                on c.project=oi.project and c.suite_basename=oi.test_suite_basename and c.test_case=oi.test_case
+            ),
+            per_case as (
+              select
+                i.project, i.test_suite_basename, i.test_case,
+                sum(case when ac.decision is not null and ac.decision <> 'uncertain' then 1 else 0 end) as labeled,
+                count(*) as total_insts
+              from insts i
+              left join annotations_cv ac
+                on ac.inst_id = i.inst_id and ac.reviewer_id = %s
+              group by i.project, i.test_suite_basename, i.test_case
+            )
+            select count(*) as n
+            from per_case
+            where labeled = total_insts and total_insts > 0
+            """,
+            (reviewer_id,),
+        )
+        done = int((done_row or {}).get("n") or 0)
+        return done, total
+
+    # eval reviewers
     total_row = db_fetchone(
         "select count(*) as n from case_assignments where reviewer_id=%s",
         (reviewer_id,)
@@ -885,92 +772,216 @@ def get_reviewer_case_progress(reviewer_id: str) -> Tuple[int, int]:
     return done, total
 
 
-def get_reviewer_progress(reviewer_id: str) -> Tuple[int, int]:
-    total_row = db_fetchone("select count(*) as n from assignments where reviewer_id=%s", (reviewer_id,))
-    total = int((total_row or {}).get("n") or 0)
+# ===================== Report =====================
 
-    labeled_row = db_fetchone(
-        """
-        select count(*) as n
-        from assignments a
-        join annotations_cv ac
-          on ac.inst_id = a.inst_id and ac.reviewer_id = a.reviewer_id
-        where a.reviewer_id=%s and ac.decision <> 'uncertain'
-        """,
-        (reviewer_id,),
-    )
-    labeled = int((labeled_row or {}).get("n") or 0)
-    return labeled, total
-
-
-# ===================== Compare =====================
-
-def compare_gold_vs_reviewer(reviewer_id: str) -> pd.DataFrame:
-    """
-    Compare ONLY the cases assigned to reviewer (case_assignments).
-    For those cases, compare reviewer annotations vs gold annotations on all instantiations.
-
-    Output columns:
-      inst_id, project, suite_basename, test_case, class_name, occurrence,
-      gold_decision, reviewer_decision, agree
-    """
+@st.cache_data(show_spinner=False)
+def list_all_reviewers() -> List[str]:
     rows = db_fetchall(
         """
-        with assigned_cases as (
-          select
-            ca.project,
-            ca.test_suite_basename,
-            ca.test_case
+        select distinct reviewer_id from (
+          select reviewer_id from case_assignments
+          union
+          select reviewer_id from annotations_cv
+        ) t
+        order by reviewer_id
+        """
+    )
+    return [r["reviewer_id"] for r in rows]
+
+
+@st.cache_data(show_spinner=False)
+def reviewer_case_progress_by_split(reviewer_id: str) -> List[Dict[str, Any]]:
+    """
+    Return split-wise progress:
+    - learning: for learning reviewers
+    - eval_seen/eval_unseen: for eval reviewers based on assignments
+    """
+    if reviewer_id in LEARNING_REVIEWERS:
+        return db_fetchall(
+            """
+            with cases as (
+              select project,
+                     suite_basename,
+                     method as test_case
+              from sampled_tests
+              where split='learning'
+            ),
+            insts as (
+              select oi.project, oi.test_suite_basename, oi.test_case, count(*) as total_insts
+              from object_instantiations oi
+              join cases c
+                on c.project = oi.project
+               and c.suite_basename = oi.test_suite_basename
+               and c.test_case = oi.test_case
+              group by oi.project, oi.test_suite_basename, oi.test_case
+            ),
+            labeled as (
+              select oi.project, oi.test_suite_basename, oi.test_case,
+                     sum(case when ac.decision is not null and ac.decision <> 'uncertain' then 1 else 0 end) as labeled_insts
+              from object_instantiations oi
+              join cases c
+                on c.project = oi.project
+               and c.suite_basename = oi.test_suite_basename
+               and c.test_case = oi.test_case
+              left join annotations_cv ac
+                on ac.inst_id = oi.inst_id and ac.reviewer_id = %s
+              group by oi.project, oi.test_suite_basename, oi.test_case
+            )
+            select
+              'learning' as split,
+              count(*) as total_cases,
+              sum(case when l.labeled_insts = i.total_insts and i.total_insts > 0 then 1 else 0 end) as done_cases
+            from insts i
+            join labeled l
+              on l.project=i.project and l.test_suite_basename=i.test_suite_basename and l.test_case=i.test_case
+            """,
+            (reviewer_id,)
+        )
+
+    return db_fetchall(
+        """
+        with assigned as (
+          select ca.project, ca.test_suite_basename, ca.test_case
           from case_assignments ca
-          where ca.reviewer_id = %s
+          where ca.reviewer_id=%s
+        ),
+        cases as (
+          select st.project,
+                 st.suite_basename,
+                 st.method as test_case,
+                 st.split
+          from sampled_tests st
+          join assigned a
+            on a.project=st.project and a.test_suite_basename=st.suite_basename and a.test_case=st.method
+          where st.split in ('eval_seen','eval_unseen')
         ),
         insts as (
-          select
-            oi.inst_id,
-            oi.project,
-            oi.test_suite_basename,
-            oi.test_case,
-            oi.class_name,
-            oi.occurrence_in_case
+          select oi.project, oi.test_suite_basename, oi.test_case, c.split, count(*) as total_insts
           from object_instantiations oi
-          join assigned_cases ac
-            on ac.project = oi.project
-           and ac.test_suite_basename = oi.test_suite_basename
-           and ac.test_case = oi.test_case
+          join cases c
+            on c.project = oi.project
+           and c.suite_basename = oi.test_suite_basename
+           and c.test_case = oi.test_case
+          group by oi.project, oi.test_suite_basename, oi.test_case, c.split
         ),
-        gold as (
-          select inst_id, decision as gold_decision
-          from annotations_cv
-          where reviewer_id = %s
-        ),
-        rev as (
-          select inst_id, decision as reviewer_decision
-          from annotations_cv
-          where reviewer_id = %s
+        labeled as (
+          select oi.project, oi.test_suite_basename, oi.test_case, c.split,
+                 sum(case when ac.decision is not null and ac.decision <> 'uncertain' then 1 else 0 end) as labeled_insts
+          from object_instantiations oi
+          join cases c
+            on c.project = oi.project
+           and c.suite_basename = oi.test_suite_basename
+           and c.test_case = oi.test_case
+          left join annotations_cv ac
+            on ac.inst_id = oi.inst_id and ac.reviewer_id = %s
+          group by oi.project, oi.test_suite_basename, oi.test_case, c.split
         )
         select
-          i.inst_id::text as inst_id,
-          i.project,
-          i.test_suite_basename as suite_basename,
-          i.test_case,
-          i.class_name,
-          i.occurrence_in_case as occurrence,
-          g.gold_decision,
-          r.reviewer_decision
+          split,
+          count(*) as total_cases,
+          sum(case when l.labeled_insts = i.total_insts and i.total_insts > 0 then 1 else 0 end) as done_cases
         from insts i
-        left join gold g on g.inst_id = i.inst_id
-        left join rev  r on r.inst_id = i.inst_id
-        order by i.project, i.test_suite_basename, i.test_case, i.class_name, i.occurrence_in_case, i.inst_id
+        join labeled l
+          on l.project=i.project and l.test_suite_basename=i.test_suite_basename and l.test_case=i.test_case and l.split=i.split
+        group by split
+        order by split
         """,
-        (reviewer_id, GOLD_REVIEWER_ID, reviewer_id),
+        (reviewer_id, reviewer_id)
     )
+
+
+def compare_between_reviewers(base_reviewer: str, other_reviewer: str) -> pd.DataFrame:
+    """
+    Compare decisions on the scope that 'other_reviewer' is responsible for:
+    - if other_reviewer is learning reviewer: learning split scope
+    - else: assigned eval cases scope
+    """
+    if other_reviewer in LEARNING_REVIEWERS:
+        rows = db_fetchall(
+            """
+            with cases as (
+              select project, suite_basename, method as test_case
+              from sampled_tests
+              where split='learning'
+            ),
+            insts as (
+              select oi.inst_id, oi.project, oi.test_suite_basename, oi.test_case, oi.class_name, oi.occurrence_in_case
+              from object_instantiations oi
+              join cases c
+                on c.project=oi.project and c.suite_basename=oi.test_suite_basename and c.test_case=oi.test_case
+            ),
+            base as (
+              select inst_id, decision as base_decision
+              from annotations_cv
+              where reviewer_id=%s
+            ),
+            oth as (
+              select inst_id, decision as other_decision
+              from annotations_cv
+              where reviewer_id=%s
+            )
+            select
+              i.inst_id::text as inst_id,
+              i.project,
+              i.test_suite_basename as suite_basename,
+              i.test_case,
+              i.class_name,
+              i.occurrence_in_case as occurrence,
+              b.base_decision,
+              o.other_decision
+            from insts i
+            left join base b on b.inst_id=i.inst_id
+            left join oth  o on o.inst_id=i.inst_id
+            order by i.project, i.test_suite_basename, i.test_case, i.class_name, i.occurrence_in_case, i.inst_id
+            """,
+            (base_reviewer, other_reviewer)
+        )
+    else:
+        rows = db_fetchall(
+            """
+            with assigned as (
+              select ca.project, ca.test_suite_basename, ca.test_case
+              from case_assignments ca
+              where ca.reviewer_id=%s
+            ),
+            insts as (
+              select oi.inst_id, oi.project, oi.test_suite_basename, oi.test_case, oi.class_name, oi.occurrence_in_case
+              from object_instantiations oi
+              join assigned a
+                on a.project=oi.project and a.test_suite_basename=oi.test_suite_basename and a.test_case=oi.test_case
+            ),
+            base as (
+              select inst_id, decision as base_decision
+              from annotations_cv
+              where reviewer_id=%s
+            ),
+            oth as (
+              select inst_id, decision as other_decision
+              from annotations_cv
+              where reviewer_id=%s
+            )
+            select
+              i.inst_id::text as inst_id,
+              i.project,
+              i.test_suite_basename as suite_basename,
+              i.test_case,
+              i.class_name,
+              i.occurrence_in_case as occurrence,
+              b.base_decision,
+              o.other_decision
+            from insts i
+            left join base b on b.inst_id=i.inst_id
+            left join oth  o on o.inst_id=i.inst_id
+            order by i.project, i.test_suite_basename, i.test_case, i.class_name, i.occurrence_in_case, i.inst_id
+            """,
+            (other_reviewer, base_reviewer, other_reviewer)
+        )
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df["agree"] = (df["gold_decision"].fillna("") == df["reviewer_decision"].fillna(""))
+    df["agree"] = (df["base_decision"].fillna("") == df["other_decision"].fillna(""))
     return df
-
 
 
 def confusion_matrix(df: pd.DataFrame) -> pd.DataFrame:
@@ -997,7 +1008,7 @@ st.title("🧪 Mock Labeler (Cross-validation)")
 
 with st.sidebar:
     st.header("Mode")
-    mode = st.radio("Choose mode", ["Review", "Compare", "Admin"], index=0)
+    mode = st.radio("Choose mode", ["Review", "Report", "Admin"], index=0)
 
     st.header("Identity")
     reviewer_id = st.text_input(
@@ -1005,19 +1016,20 @@ with st.sidebar:
         value=st.session_state.get("reviewer_id", "")
     ).strip()
     st.session_state["reviewer_id"] = reviewer_id
-    # st.caption("Tip: input 'gold' to view/edit gold labels in Review mode.")
+
+    st.caption("Learning reviewers can add/modify rules. Eval reviewers label assigned eval cases (rules frozen).")
 
 
 # ---------- Admin ----------
 if mode == "Admin":
-    st.subheader("🛠 Admin: Assignments (Manual counts)")
+    st.subheader("🛠 Admin: Case assignments for evaluation")
 
-    cases_scope = get_sampled_scope_cases()
-    scope_total = len(cases_scope)
-    st.caption(f"Sampled scope test cases: {scope_total}")
+    eval_cases = get_eval_scope_cases()
+    scope_total = len(eval_cases)
+    st.caption(f"Evaluation scope cases (eval_seen + eval_unseen): {scope_total}")
 
-    st.write("Provide **exactly 4** reviewers and how many instantiations each should review. "
-             "Assignments are created by deterministic slicing of the sampled-scope inst_id list.")
+    st.write("Provide **exactly 4** evaluation reviewers and how many eval cases each should review. "
+             "This will assign each evaluation case exactly once by deterministic slicing (sampled_tests.id order).")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1034,29 +1046,26 @@ if mode == "Admin":
     st.session_state.update({"r1": r1, "r2": r2, "r3": r3, "r4": r4, "n1": int(n1), "n2": int(n2), "n3": int(n3), "n4": int(n4)})
 
     total_need = int(n1 + n2 + n3 + n4)
-    st.info(f"Requested total = {total_need} / scope total = {scope_total} (leftover = {scope_total - total_need})")
-    overwrite = st.checkbox("Overwrite existing assignments for these reviewers", value=False)
+    st.info(f"Requested total = {total_need} / eval scope total = {scope_total}")
 
-
-    if st.button("✅ Create / Overwrite assignments (manual counts)"):
+    if st.button("✅ Create / Overwrite eval case assignments"):
         try:
             res = create_case_assignments_by_counts(
-                [(r1, int(n1)), (r2, int(n2)), (r3, int(n3)), (r4, int(n4))],
-                overwrite=overwrite,
+                [(r1, int(n1)), (r2, int(n2)), (r3, int(n3)), (r4, int(n4))]
             )
             st.cache_data.clear()
-            st.success("Assignments created/overwritten.")
+            st.success("Eval assignments created/overwritten.")
             st.json(res)
         except Exception as e:
             st.error(str(e))
 
     st.divider()
-    st.subheader("Current assignment counts")
-    ac = get_assignment_counts()
+    st.subheader("Current eval case assignment counts")
+    ac = get_case_assignment_counts()
     if ac:
         st.dataframe(pd.DataFrame(ac), use_container_width=True)
     else:
-        st.info("No assignments yet.")
+        st.info("No case_assignments yet.")
 
     st.stop()
 
@@ -1068,64 +1077,13 @@ if mode == "Review":
         st.stop()
 
     st.sidebar.header("Your progress")
-
-    if reviewer_id == GOLD_REVIEWER_ID:
-        # gold: full sampled scope case progress
-        total_row = db_fetchone("select count(*) as n from sampled_tests")
-        total = int((total_row or {}).get("n") or 0)
-
-        done_row = db_fetchone(
-            """
-            with stf as (
-              select
-                st.project,
-                regexp_replace(replace(st.file, '\\\\', '/'), '^.*/', '') as suite_basename,
-                st.method as test_case
-              from sampled_tests st
-            ),
-            insts as (
-              select oi.inst_id, oi.project, oi.test_suite_basename, oi.test_case
-              from object_instantiations oi
-              join stf
-                on stf.project = oi.project
-               and stf.suite_basename = oi.test_suite_basename
-               and stf.test_case = oi.test_case
-            ),
-            per_case as (
-              select
-                s.project, s.suite_basename, s.test_case,
-                count(i.inst_id) as total_insts,
-                sum(case when ac.decision is not null and ac.decision <> 'uncertain' then 1 else 0 end) as labeled
-              from stf s
-              left join insts i
-                on i.project = s.project
-               and i.test_suite_basename = s.suite_basename
-               and i.test_case = s.test_case
-              left join annotations_cv ac
-                on ac.inst_id = i.inst_id and ac.reviewer_id = %s
-              group by s.project, s.suite_basename, s.test_case
-            )
-            select count(*) as n
-            from per_case
-            where total_insts > 0 and labeled = total_insts
-            """,
-            (GOLD_REVIEWER_ID,),
-        )
-        done = int((done_row or {}).get("n") or 0)
-    else:
-        done, total = get_reviewer_case_progress(reviewer_id)
-
+    done, total = get_reviewer_case_progress(reviewer_id)
     st.sidebar.progress((done / total) if total else 0.0)
     st.sidebar.caption(f"{done} / {total} cases done")
 
-    # gold: can browse full sampled scope without assignments
-    if reviewer_id == GOLD_REVIEWER_ID:
-        cases = get_sampled_cases_all()
-    else:
-        cases = get_assigned_cases_for_reviewer(reviewer_id)
-
+    cases = get_cases_for_reviewer_by_process(reviewer_id)
     if not cases:
-        st.info("No cases available for this reviewer_id. For non-gold reviewers, ask admin to create assignments.")
+        st.info("No cases available for this reviewer_id. Check assignments for eval reviewers.")
         st.stop()
 
     if "case_idx" not in st.session_state:
@@ -1146,7 +1104,7 @@ if mode == "Review":
         if st.button("Next Case ⏭"):
             move_case(+1)
     with col_nav3:
-        st.write(f"Assigned Case {st.session_state.case_idx + 1} / {len(cases)}")
+        st.write(f"Case {st.session_state.case_idx + 1} / {len(cases)}")
     with col_nav4:
         jump = st.number_input("Jump", min_value=1, max_value=len(cases), value=st.session_state.case_idx + 1, step=1)
         if st.button("Go"):
@@ -1157,9 +1115,10 @@ if mode == "Review":
     file_col = row["file"]
     method_name = row["method"]
     suite_basename = basename_of_path(file_col)
+    split = row.get("split")
 
-    st.subheader("📄 Test Case (Assigned)")
-    st.markdown(f"**Reviewer:** `{reviewer_id}`")
+    st.subheader("📄 Test Case")
+    st.markdown(f"**Reviewer:** `{reviewer_id}`  |  **Split:** `{split}`")
     st.markdown(f"**Project:** `{project_name}`  |  **File:** `{file_col}`  |  **Method:** `{method_name}`")
     st.caption(
         f"TestAware: {row.get('testaware')} | "
@@ -1168,12 +1127,15 @@ if mode == "Review":
         f"CCTR_Bin: {row.get('cctr_bin')}"
     )
 
+    can_edit_rules = (split in LEARNING_SPLITS) and (reviewer_id in LEARNING_REVIEWERS)
+    if RULES_FROZEN_FOR_EVAL and (split in EVAL_SPLITS):
+        can_edit_rules = False
+
+    # ---- Test Source ----
     st.subheader("🧾 Test Source")
 
-    test_path, test_path_note = resolve_test_path(project_name, row)
+    test_path, _ = resolve_test_path(project_name, row)
     test_src_full = row.get("test_source") or (get_source_content(project_name, test_path) if test_path else "")
-
-    # st.caption(f"Resolved test_path: {test_path}  ({test_path_note})")
 
     if not test_src_full:
         st.warning("No test source content found.")
@@ -1184,22 +1146,18 @@ if mode == "Review":
         if toggle_key not in st.session_state:
             st.session_state[toggle_key] = False
 
-        # If we failed to extract method, fallback = show full suite directly
         if not method_src:
             st.warning(f"Could not extract method `{method_name}`. Showing full test suite.")
             st.session_state[toggle_key] = True
 
-        # Default view: show current method only (if extracted)
         if method_src and not st.session_state[toggle_key]:
             st.caption(f"Showing current test case only: `{method_name}`")
             st.code(method_src, language="java")
 
-        # Toggle button
         btn_label = "Show full test suite" if not st.session_state[toggle_key] else "Hide full test suite"
         if st.button(btn_label, key=f"btn_{toggle_key}"):
             st.session_state[toggle_key] = not st.session_state[toggle_key]
 
-        # Full suite view (syntax-highlighted)
         if st.session_state[toggle_key]:
             st.caption("Full test suite (method is marked with comment banners)")
             marked_src = add_markers_around_method(test_src_full, method_src, method_name)
@@ -1208,7 +1166,7 @@ if mode == "Review":
     # ---- Dependencies ----
     st.subheader("🔗 Dependencies")
 
-    deps = get_dependencies(project_name, test_path)
+    deps = get_dependencies(project_name, test_path, suite_basename=suite_basename)
     if deps:
         max_deps = st.number_input(
             "Max dependency files to show",
@@ -1218,22 +1176,18 @@ if mode == "Review":
             step=5
         )
         for dp in deps[: int(max_deps)]:
-            title = java_class_name_from_path(dp)  # only class name shown
+            title = java_class_name_from_path(dp)
             with st.expander(title):
-                # optional: show full path inside the expander
-                # st.caption(dp)
                 st.code(get_source_content(project_name, dp), language="java")
     else:
-        st.caption("No dependencies found for this test.")
+        st.caption("No dependencies found for this test (exact or basename fallback).")
 
-
-    st.subheader("🧩 Your Assigned Instantiations in This Case")
-
-    # gold: see all instantiations in sampled scope case
+    # ---- Instantiations ----
+    st.subheader("🧩 Instantiations in This Case (sampled scope)")
     insts = get_instantiations_for_case(project_name, suite_basename, method_name)
 
     if not insts:
-        st.info("No instantiations available in this case for you. Click Next Case.")
+        st.info("No instantiations found for this case.")
         st.stop()
 
     inst_ids = [x["inst_id"] for x in insts]
@@ -1254,7 +1208,6 @@ if mode == "Review":
         inst_id = inst["inst_id"]
         class_name = inst["class_name"]
         occurrence = safe_int(inst.get("occurrence_in_case"), 0)
-        existing_mocked = inst.get("mocked", "")
         ui_suffix = f"{inst_id}_{idx}"
 
         prev = ann_map.get(inst_id, {})
@@ -1273,8 +1226,7 @@ if mode == "Review":
         with st.container(border=True):
             st.markdown(
                 f"**[{idx+1}] Class:** `{class_name}`  |  "
-                f"**Occurrence:** `#{occurrence}`  |  "
-                # f"**Existing Mocked:** `{existing_mocked}`"
+                f"**Occurrence:** `#{occurrence}`"
             )
             st.caption(f"inst_id: {inst_id}")
 
@@ -1285,31 +1237,35 @@ if mode == "Review":
                 key=f"rules_{ui_suffix}",
             )
 
-            with st.expander("➕ Add new rule"):
-                new_rule_type = st.selectbox("Type", ["Base Rule", "Extended Rule", "Other"], key=f"new_type_{ui_suffix}")
-                new_rule_cat = st.text_input("High Level Category", value="Class Characteristics", key=f"new_cat_{ui_suffix}")
-                new_rule_criterion = st.text_area("Criterion", key=f"new_criterion_{ui_suffix}")
-                new_rule_mock = st.text_input("Mock? (Yes/No/etc.)", value="Yes", key=f"new_mock_{ui_suffix}")
+            if can_edit_rules:
+                with st.expander("➕ Add new rule"):
+                    new_rule_type = st.selectbox("Type", ["Base Rule", "Extended Rule", "Other"], key=f"new_type_{ui_suffix}")
+                    new_rule_cat = st.text_input("High Level Category", value="Class Characteristics", key=f"new_cat_{ui_suffix}")
+                    new_rule_criterion = st.text_area("Criterion", key=f"new_criterion_{ui_suffix}")
+                    new_rule_mock = st.text_input("Mock? (Yes/No/etc.)", value="Yes", key=f"new_mock_{ui_suffix}")
 
-                if st.button("💾 Add rule & select it", key=f"add_rule_{ui_suffix}"):
-                    if new_rule_criterion.strip():
-                        new_id = insert_rule(
-                            new_rule_type.strip(),
-                            new_rule_cat.strip(),
-                            new_rule_criterion.strip(),
-                            new_rule_mock.strip(),
-                            created_by=reviewer_id,
-                        )
-                        new_label = f"{new_id:02d} [{new_rule_type.strip()}] {new_rule_criterion.strip()} ({new_rule_mock.strip()})"
-                        mk = f"rules_{ui_suffix}"
-                        cur = st.session_state.get(mk, []) or []
-                        if new_label not in cur:
-                            st.session_state[mk] = cur + [new_label]
-                        st.cache_data.clear()
-                        st.success(f"Rule added: ID={new_id}")
-                        st.rerun()
-                    else:
-                        st.warning("Criterion is required.")
+                    if st.button("💾 Add rule & select it", key=f"add_rule_{ui_suffix}"):
+                        if new_rule_criterion.strip():
+                            new_id = insert_rule(
+                                new_rule_type.strip(),
+                                new_rule_cat.strip(),
+                                new_rule_criterion.strip(),
+                                new_rule_mock.strip(),
+                                created_by=reviewer_id,
+                            )
+                            new_label = f"{new_id:02d} [{new_rule_type.strip()}] {new_rule_criterion.strip()} ({new_rule_mock.strip()})"
+                            mk = f"rules_{ui_suffix}"
+                            cur = st.session_state.get(mk, []) or []
+                            if new_label not in cur:
+                                st.session_state[mk] = cur + [new_label]
+                            st.cache_data.clear()
+                            st.success(f"Rule added: ID={new_id}")
+                            st.rerun()
+                        else:
+                            st.warning("Criterion is required.")
+            else:
+                if split in EVAL_SPLITS:
+                    st.caption("🔒 Rules are frozen in evaluation. You cannot add/modify rules here.")
 
             st.radio(
                 "Decision",
@@ -1336,7 +1292,7 @@ if mode == "Review":
         if (ann_map.get(iid) and ann_map[iid].get("decision") != "uncertain")
     )
     st.progress(labeled_case / len(inst_ids) if inst_ids else 0.0)
-    st.caption(f"This case (your assigned insts): labeled {labeled_case} / {len(inst_ids)}")
+    st.caption(f"This case: labeled {labeled_case} / {len(inst_ids)} instantiations (decision != uncertain)")
 
     b1, b2 = st.columns([1, 1])
     with b1:
@@ -1387,61 +1343,98 @@ if mode == "Review":
     st.stop()
 
 
-# ---------- Compare ----------
-if mode == "Compare":
-    st.subheader("📊 Compare (gold vs reviewer)")
+# ---------- Report ----------
+if mode == "Report":
+    st.subheader("📈 Report")
 
-    revs = db_fetchall("select distinct reviewer_id from case_assignments order by reviewer_id")
-    revs = [r["reviewer_id"] for r in revs if r["reviewer_id"] != GOLD_REVIEWER_ID]
-
-    sel = st.selectbox("Select reviewer", options=revs, index=0 if revs else None)
-    if not sel:
-        st.info("No reviewers found in case_assignments yet. Create assignments in Admin mode.")
+    reviewers = list_all_reviewers()
+    if not reviewers:
+        st.info("No reviewers found yet.")
         st.stop()
 
-    df = compare_gold_vs_reviewer(sel)
+    st.markdown("### Overview (case progress)")
+    overview_rows = []
+    for rid in reviewers:
+        prog = reviewer_case_progress_by_split(rid)
+        d = {
+            "reviewer_id": rid,
+            "learning_done": 0, "learning_total": 0,
+            "eval_seen_done": 0, "eval_seen_total": 0,
+            "eval_unseen_done": 0, "eval_unseen_total": 0,
+        }
+        for r in prog:
+            sp = r["split"]
+            if sp == "learning":
+                d["learning_done"] = int(r["done_cases"] or 0)
+                d["learning_total"] = int(r["total_cases"] or 0)
+            elif sp == "eval_seen":
+                d["eval_seen_done"] = int(r["done_cases"] or 0)
+                d["eval_seen_total"] = int(r["total_cases"] or 0)
+            elif sp == "eval_unseen":
+                d["eval_unseen_done"] = int(r["done_cases"] or 0)
+                d["eval_unseen_total"] = int(r["total_cases"] or 0)
+        overview_rows.append(d)
+
+    st.dataframe(pd.DataFrame(overview_rows), use_container_width=True)
+
+    st.divider()
+    st.markdown("### Reviewer detail")
+
+    sel = st.selectbox("Select reviewer", options=reviewers, index=0)
+    prog = reviewer_case_progress_by_split(sel)
+    st.write("Progress by split:")
+    st.dataframe(pd.DataFrame(prog), use_container_width=True)
+
+    st.divider()
+    st.markdown("### Compare decisions")
+
+    base_default_idx = reviewers.index("gold") if "gold" in reviewers else 0
+    base = st.selectbox("Baseline reviewer", options=reviewers, index=base_default_idx)
+    other = st.selectbox("Other reviewer", options=[r for r in reviewers if r != base], index=0)
+
+    df = compare_between_reviewers(base, other)
     if df.empty:
-        st.warning("No comparable rows found. Check that assignments exist and gold labels are imported.")
+        st.warning("No comparable rows found for this pair/scope.")
         st.stop()
 
     total = len(df)
-    have_reviewer = int(df["reviewer_decision"].notna().sum())
-    have_gold = int(df["gold_decision"].notna().sum())
+    have_other = int(df["other_decision"].notna().sum())
+    have_base = int(df["base_decision"].notna().sum())
     agree = int(df["agree"].sum())
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total assigned insts", total)
-    c2.metric("Reviewer labeled", have_reviewer)
-    c3.metric("Gold available", have_gold)
+    c1.metric("Total insts in scope", total)
+    c2.metric("Other labeled", have_other)
+    c3.metric("Baseline available", have_base)
     c4.metric("Agreements", agree)
 
-    denom = max(have_reviewer, 1)
-    st.caption(f"Agreement rate (among reviewer-labeled rows): {agree/denom:.3f}")
+    denom = max(have_other, 1)
+    st.caption(f"Agreement rate (among other-labeled rows): {agree/denom:.3f}")
 
-    st.subheader("Confusion matrix (gold vs reviewer)")
-    cm = confusion_matrix(df)
+    st.markdown("#### Confusion matrix")
+    tmp = df.rename(columns={"base_decision": "gold_decision", "other_decision": "reviewer_decision"})
+    cm = confusion_matrix(tmp)
     st.dataframe(cm, use_container_width=True)
 
-    st.subheader("Disagreements")
-    only_disagree = df[
-        (df["reviewer_decision"].notna()) &
-        (df["gold_decision"].notna()) &
+    st.markdown("#### Disagreements (both labeled)")
+    disagree = df[
+        (df["other_decision"].notna()) &
+        (df["base_decision"].notna()) &
         (df["agree"] == False)
     ].copy()
-    st.caption(f"Disagreements (both labeled): {len(only_disagree)}")
-    st.dataframe(only_disagree.head(500), use_container_width=True)
+    st.dataframe(disagree.head(500), use_container_width=True)
 
-    st.subheader("Export")
+    st.markdown("#### Export")
     st.download_button(
         "⬇️ Download full comparison CSV",
         data=to_csv_download(df),
-        file_name=f"compare_gold_vs_{sel}.csv",
+        file_name=f"compare_{base}_vs_{other}.csv",
         mime="text/csv",
     )
     st.download_button(
         "⬇️ Download disagreements CSV",
-        data=to_csv_download(only_disagree),
-        file_name=f"disagreements_gold_vs_{sel}.csv",
+        data=to_csv_download(disagree),
+        file_name=f"disagreements_{base}_vs_{other}.csv",
         mime="text/csv",
     )
 
