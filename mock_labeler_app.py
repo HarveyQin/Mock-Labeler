@@ -448,7 +448,11 @@ def get_instantiations_for_case(project: str, suite_basename: str, method: str) 
           source_row_index
         from object_instantiations
         where project=%s and test_suite_basename=%s and test_case=%s
-        order by class_name, occurrence_in_case, source_row_index nulls last, inst_id
+        order by
+          source_row_index nulls last,
+          class_name,
+          occurrence_in_case,
+          inst_id
         """,
         (project, suite_basename, method),
     )

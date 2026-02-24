@@ -31,8 +31,17 @@ PROJECTS_BASE_DIR = Path(r"E:\Files\Mock_Project\ML\ML-experiment")
 OBJECT_LIST_DIR = Path(r"E:\Files\Mock_Project\ML\Meets\Mock Decision Dataset\Pilot Review\Object Instantiations Lists")
 
 PROJECT_FOLDER_OVERRIDES: Dict[str, str] = {
-    # "cloudstack": "cloudstack-4.20.0.0",
-    # "commons-configuration": "commons-configuration-rel-commons-configuration-2.11.0",
+    "cloudstack": "cloudstack-4.20.0.0",
+    "commons-configuration": "commons-configuration-rel-commons-configuration-2.11.0",
+    "camel": "camel-camel-4.10.8",
+    "maven": "maven-maven-3.9.12",
+    "crunch": "crunch-apache-crunch-1.0.0",
+    "hadoop": "hadoop-rel-release-3.4.2",
+    "hbase": "hbase-rel-2.6.4",
+    "storm": "storm-2.8.3",
+    "flink": "flink-release-2.2.0",
+    "hive": "hive-rel-release-4.2.0",
+    "dubbo": "dubbo-dubbo-3.3.6",
 }
 
 INST_NAMESPACE = uuid.UUID("3b4f2fb7-3c34-4d3a-8c62-7c4cb1c40a3d")
