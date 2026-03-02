@@ -35,6 +35,12 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
+import time
+from contextlib import contextmanager
+import psycopg2
+from psycopg2.pool import SimpleConnectionPool
+from psycopg2.extras import RealDictCursor
+from psycopg2 import OperationalError, InterfaceError
 
 
 # ===================== CONFIG =====================
@@ -54,34 +60,86 @@ RULES_FROZEN_FOR_EVAL = True
 # ===================== DB =====================
 
 @st.cache_resource
-def get_conn():
+def get_pool() -> SimpleConnectionPool:
     db_url = st.secrets.get("DB_URL")
     if not db_url:
         raise RuntimeError("Missing DB_URL in st.secrets.")
-    conn = psycopg2.connect(db_url)
-    conn.autocommit = True
-    return conn
+
+    return SimpleConnectionPool(
+        minconn=1,
+        maxconn=5,
+        dsn=db_url,
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+        application_name="mock-labeler",
+    )
 
 
-def db_fetchall(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    conn = get_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, params)
-        return list(cur.fetchall())
+@contextmanager
+def get_conn():
+    """
+    Backward-compatible name: yields a live connection from the pool.
+    Automatically discards broken connections.
+    """
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        conn.autocommit = True
+        yield conn
+        pool.putconn(conn)
+    except (OperationalError, InterfaceError):
+        # Drop broken conn
+        try:
+            pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        raise
+    except Exception:
+        pool.putconn(conn)
+        raise
 
 
-def db_fetchone(sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
-    conn = get_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, params)
-        row = cur.fetchone()
-        return dict(row) if row else None
+def _run_db(fn, retries: int = 2, backoff: float = 0.5):
+    last_err = None
+    for i in range(retries + 1):
+        try:
+            with get_conn() as conn:
+                return fn(conn)
+        except (OperationalError, InterfaceError) as e:
+            last_err = e
+            if i < retries:
+                time.sleep(backoff * (2 ** i))
+                continue
+            raise
+    raise last_err
 
 
-def db_execute(sql: str, params: tuple = ()) -> None:
-    conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
+def db_fetchall(sql: str, params: tuple = ()):
+    def op(conn):
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+    return _run_db(op)
+
+
+def db_fetchone(sql: str, params: tuple = ()):
+    def op(conn):
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return dict(row) if row else None
+    return _run_db(op)
+
+
+def db_execute(sql: str, params: tuple = ()):
+    def op(conn):
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+        return None
+    return _run_db(op)
 
 
 # ===================== Helpers =====================
