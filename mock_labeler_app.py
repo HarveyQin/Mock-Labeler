@@ -715,19 +715,19 @@ def create_case_assignments_by_counts(
         cur += n
 
     if rows:
-        conn = get_conn()
-        with conn.cursor() as cur2:
-            execute_values(
-                cur2,
-                """
-                insert into case_assignments(project, test_suite_basename, test_case, reviewer_id, bucket)
-                values %s
-                on conflict (project, test_suite_basename, test_case, reviewer_id)
-                do update set bucket = excluded.bucket, assigned_at = now()
-                """,
-                rows,
-                page_size=1000,
-            )
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """
+                    insert into case_assignments(project, test_suite_basename, test_case, reviewer_id, bucket)
+                    values %s
+                    on conflict (project, test_suite_basename, test_case, reviewer_id)
+                    do update set bucket = excluded.bucket, assigned_at = now()
+                    """,
+                    rows,
+                    page_size=1000,
+                )
 
     return {
         "eval_scope_total_cases": total_scope,
