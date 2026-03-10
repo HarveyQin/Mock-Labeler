@@ -540,9 +540,10 @@ def get_instantiations_for_case(project: str, suite_basename: str, method: str) 
 def load_rules() -> List[Dict[str, Any]]:
     return db_fetchall(
         """
-        select id, type, high_level_category, criterion, mock_decision
+        select id, type, high_level_category, criterion, mock_decision, display_order
         from rules
-        order by id
+        where display_order is not null
+        order by display_order
         """
     )
 
