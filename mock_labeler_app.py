@@ -46,7 +46,7 @@ from psycopg2 import OperationalError, InterfaceError
 # ===================== CONFIG =====================
 
 VALID_DECISIONS = ["mock", "no-mock", "uncertain", "skip"]
-GOLD_REVIEWER_ID = "gold"
+GOLD_REVIEWER_ID = "Hanbin"
 
 LEARNING_SPLITS = {"learning"}
 EVAL_SPLITS = {"eval_seen", "eval_unseen"}
