@@ -433,10 +433,32 @@ def get_eval_scope_cases() -> List[Dict[str, Any]]:
 @st.cache_data(show_spinner=False)
 def get_cases_for_reviewer_by_process(reviewer_id: str) -> List[Dict[str, Any]]:
     """
-    New process:
-    - Learning split: only LEARNING_REVIEWERS can review; no assignments needed
-    - Eval splits: only assigned cases via case_assignments
+    Review scope:
+    - gold: can browse ALL sampled cases
+    - learning reviewers: can browse learning split
+    - eval reviewers: can browse only their assigned eval cases
     """
+    if reviewer_id == GOLD_REVIEWER_ID:
+        return db_fetchall(
+            r"""
+            select
+              st.id,
+              st.project,
+              st.file,
+              st.method,
+              regexp_replace(replace(st.file, '\\', '/'), '^.*/', '') as suite_basename,
+              st.split,
+              st.testaware,
+              st.mockintensity,
+              st.dependencycount,
+              st.cctr_bin,
+              st.test_file_path,
+              st.test_source
+            from sampled_tests st
+            order by st.id
+            """
+        )
+
     if reviewer_id in LEARNING_REVIEWERS:
         return db_fetchall(
             r"""
@@ -489,7 +511,6 @@ def get_cases_for_reviewer_by_process(reviewer_id: str) -> List[Dict[str, Any]]:
         """,
         (reviewer_id,),
     )
-
 
 def get_instantiations_for_case(project: str, suite_basename: str, method: str) -> List[Dict[str, Any]]:
     return db_fetchall(
@@ -1144,12 +1165,26 @@ if mode == "Review":
     st.sidebar.caption(f"{done} / {total} cases done")
 
     cases = get_cases_for_reviewer_by_process(reviewer_id)
+
+    st.sidebar.header("Case filter")
+    split_filter = st.sidebar.selectbox(
+        "Split filter",
+        ["ALL", "learning", "eval_seen", "eval_unseen"],
+        index=0
+    )
+
+    if split_filter != "ALL":
+        cases = [c for c in cases if c.get("split") == split_filter]
+
     if not cases:
-        st.info("No cases available for this reviewer_id. Check assignments for eval reviewers.")
+        st.info("No cases available under current reviewer_id / split filter.")
         st.stop()
 
     if "case_idx" not in st.session_state:
         st.session_state.case_idx = 0
+
+    if st.session_state.case_idx >= len(cases):
+        st.session_state.case_idx = max(0, len(cases) - 1)
 
     def move_case(delta: int):
         n = len(cases)
