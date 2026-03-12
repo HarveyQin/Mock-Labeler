@@ -1177,8 +1177,21 @@ if mode == "Review":
     if split_filter != "ALL":
         cases = [c for c in cases if c.get("split") == split_filter]
 
+    test_case_query = st.sidebar.text_input(
+        "Search test case name",
+        value=st.session_state.get("test_case_query", "")
+    ).strip()
+    st.session_state["test_case_query"] = test_case_query
+
+    if test_case_query:
+        q = test_case_query.lower()
+        cases = [
+            c for c in cases
+            if q in str(c.get("method", "")).lower()
+        ]
+
     if not cases:
-        st.info("No cases available under current reviewer_id / split filter.")
+        st.info("No cases available under current reviewer_id / filters.")
         st.stop()
 
     if "case_idx" not in st.session_state:
